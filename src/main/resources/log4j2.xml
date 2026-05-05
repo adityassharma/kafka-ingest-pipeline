@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    Log4j2 configuration for kafka-ingest-pipeline.
+    - Default level : INFO
+    - Console appender for development / IntelliJ run
+    - Rolling file appender that rolls over nightly, retaining 6 gzipped archives
+    - Log directory resolved from system property "app.log.dir" (set by startup scripts)
+      Falls back to "logs" directory relative to working directory.
+-->
+<Configuration status="WARN" monitorInterval="30">
+
+    <Properties>
+        <!-- Override at launch: -Dapp.log.dir=/path/to/logs -->
+        <Property name="LOG_DIR">${sys:app.log.dir:-logs}</Property>
+        <Property name="LOG_PATTERN">%d{yyyy-MM-dd HH:mm:ss.SSS} [%t] %-5level %logger{36} - %msg%n</Property>
+    </Properties>
+
+    <Appenders>
+
+        <!-- Console — useful in IntelliJ and for dev -->
+        <Console name="Console" target="SYSTEM_OUT">
+            <PatternLayout pattern="${LOG_PATTERN}"/>
+        </Console>
+
+        <!--
+            Rolling file appender.
+            filePattern uses %i (index) after the date so the rename step during
+            nightly rollover doesn't collide with a still-open file on Windows.
+        -->
+        <RollingFile name="RollingFile"
+                     fileName="${LOG_DIR}/kafka-ingest-pipeline.log"
+                     filePattern="${LOG_DIR}/kafka-ingest-pipeline.%d{yyyy-MM-dd}.%i.log.gz"
+                     immediateFlush="true">
+            <PatternLayout pattern="${LOG_PATTERN}"/>
+            <Policies>
+                <!-- Roll over at midnight -->
+                <TimeBasedTriggeringPolicy interval="1" modulate="true"/>
+                <!-- Also roll if a single day's log exceeds 256 MB -->
+                <SizeBasedTriggeringPolicy size="256 MB"/>
+            </Policies>
+            <!-- Keep last 6 rolled (gzipped) files; delete older ones -->
+            <DefaultRolloverStrategy max="6">
+                <Delete basePath="${LOG_DIR}" maxDepth="1">
+                    <IfFileName glob="kafka-ingest-pipeline.*.log.gz"/>
+                    <IfAccumulatedFileCount exceeds="6"/>
+                </Delete>
+            </DefaultRolloverStrategy>
+        </RollingFile>
+
+    </Appenders>
+
+    <Loggers>
+
+        <!-- Quieten chatty Kafka client internals — set to WARN to reduce noise -->
+        <Logger name="org.apache.kafka" level="WARN" additivity="false">
+            <AppenderRef ref="Console"/>
+            <AppenderRef ref="RollingFile"/>
+        </Logger>
+
+        <!-- Elasticsearch client -->
+        <Logger name="co.elastic" level="WARN" additivity="false">
+            <AppenderRef ref="Console"/>
+            <AppenderRef ref="RollingFile"/>
+        </Logger>
+
+        <!-- Application loggers -->
+        <Logger name="io.github.adityassharma.kafka" level="INFO" additivity="false">
+            <AppenderRef ref="Console"/>
+            <AppenderRef ref="RollingFile"/>
+        </Logger>
+
+        <!-- Root catches everything else -->
+        <Root level="INFO">
+            <AppenderRef ref="Console"/>
+            <AppenderRef ref="RollingFile"/>
+        </Root>
+
+    </Loggers>
+
+</Configuration>
