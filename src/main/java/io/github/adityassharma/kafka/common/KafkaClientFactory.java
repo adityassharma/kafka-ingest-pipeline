@@ -1,9 +1,11 @@
 package io.github.adityassharma.kafka.common;
 
+import org.apache.kafka.clients.CommonClientConfigs;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.common.config.SslConfigs;
 
 import java.util.Properties;
 
@@ -31,7 +33,7 @@ public final class KafkaClientFactory {
     // -----------------------------------------------------------------------
 
     /**
-     * Build a {@link KafkaConsumer<String, String>} from the supplied properties.
+     * Build a {@link KafkaConsumer} of type {@code KafkaConsumer<String, String>} from the supplied properties.
      *
      * <p>The following keys are read from the properties file:
      * <ul>
@@ -60,7 +62,7 @@ public final class KafkaClientFactory {
     // -----------------------------------------------------------------------
 
     /**
-     * Build a {@link KafkaProducer<String, String>} from the supplied properties.
+     * Build a {@link KafkaProducer} of type {@code KafkaProducer<String, String>} from the supplied properties.
      *
      * <p>The following keys are read from the properties file:
      * <ul>
@@ -113,6 +115,11 @@ public final class KafkaClientFactory {
         copyOptional(target, src, ConsumerConfig.FETCH_MIN_BYTES_CONFIG);
         copyOptional(target, src, ConsumerConfig.FETCH_MAX_WAIT_MS_CONFIG);
         copyOptional(target, src, ConsumerConfig.MAX_PARTITION_FETCH_BYTES_CONFIG);
+
+        // Security / TLS — forwarded only when present in the properties file.
+        // Set security.protocol=SSL for one-way TLS (truststore only).
+        // Add ssl.keystore.* properties to enable mTLS (mutual TLS).
+        copySslProps(target, src);
     }
 
     private static void copyKafkaProducerProps(Properties target, AppProperties src) {
@@ -147,6 +154,21 @@ public final class KafkaClientFactory {
 
         // Idempotence
         copyOptional(target, src, ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG);
+
+        // Security / TLS — forwarded only when present in the properties file.
+        // Set security.protocol=SSL for one-way TLS (truststore only).
+        // Add ssl.keystore.* properties to enable mTLS (mutual TLS).
+        copySslProps(target, src);
+    }
+
+    private static void copySslProps(Properties target, AppProperties src) {
+        copyOptional(target, src, CommonClientConfigs.SECURITY_PROTOCOL_CONFIG);
+        copyOptional(target, src, SslConfigs.SSL_TRUSTSTORE_LOCATION_CONFIG);
+        copyOptional(target, src, SslConfigs.SSL_TRUSTSTORE_PASSWORD_CONFIG);
+        copyOptional(target, src, SslConfigs.SSL_KEYSTORE_LOCATION_CONFIG);
+        copyOptional(target, src, SslConfigs.SSL_KEYSTORE_PASSWORD_CONFIG);
+        copyOptional(target, src, SslConfigs.SSL_KEY_PASSWORD_CONFIG);
+        copyOptional(target, src, SslConfigs.SSL_ENDPOINT_IDENTIFICATION_ALGORITHM_CONFIG);
     }
 
     private static void copyRequired(Properties target, AppProperties src, String key) {
