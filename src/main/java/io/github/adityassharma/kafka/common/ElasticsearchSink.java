@@ -6,13 +6,21 @@ import co.elastic.clients.json.jackson.JacksonJsonpMapper;
 import co.elastic.clients.transport.ElasticsearchTransport;
 import co.elastic.clients.transport.rest_client.RestClientTransport;
 import org.apache.http.HttpHost;
+import org.apache.http.auth.AuthScope;
+import org.apache.http.auth.UsernamePasswordCredentials;
+import org.apache.http.impl.client.BasicCredentialsProvider;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.elasticsearch.client.RestClient;
+import org.elasticsearch.client.RestClientBuilder;
 
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.TrustManagerFactory;
 import java.io.Closeable;
+import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.StringReader;
+import java.security.KeyStore;
 
 /**
  * Thread-safe wrapper around the Elasticsearch Java client.
@@ -40,6 +48,10 @@ public class ElasticsearchSink implements Closeable {
      *   <li>{@code elasticsearch.port} (default: 9200)</li>
      *   <li>{@code elasticsearch.scheme} (default: http)</li>
      *   <li>{@code elasticsearch.index} (required)</li>
+     *   <li>{@code elasticsearch.username} (optional)</li>
+     *   <li>{@code elasticsearch.password} (optional)</li>
+     *   <li>{@code elasticsearch.ssl.truststore.location} (optional, JKS)</li>
+     *   <li>{@code elasticsearch.ssl.truststore.password} (optional)</li>
      * </ul>
      */
     public ElasticsearchSink(AppProperties appProps) {
@@ -51,10 +63,27 @@ public class ElasticsearchSink implements Closeable {
         LOG.info("Connecting to Elasticsearch at {}://{}:{} index={}",
             scheme, host, port, indexName);
 
-        // Low-level REST client (manages HTTP connections)
-        this.restClient = RestClient.builder(new HttpHost(host, port, scheme)).build();
+        RestClientBuilder builder = RestClient.builder(new HttpHost(host, port, scheme));
 
-        // High-level Elasticsearch Java client
+        String truststorePath     = appProps.get("elasticsearch.ssl.truststore.location", null);
+        String truststorePassword = appProps.get("elasticsearch.ssl.truststore.password", null);
+        String username           = appProps.get("elasticsearch.username", null);
+        String password           = appProps.get("elasticsearch.password", null);
+
+        builder.setHttpClientConfigCallback(httpClientBuilder -> {
+            if (truststorePath != null) {
+                httpClientBuilder.setSSLContext(buildSslContext(truststorePath, truststorePassword));
+            }
+            if (username != null) {
+                BasicCredentialsProvider cp = new BasicCredentialsProvider();
+                cp.setCredentials(AuthScope.ANY, new UsernamePasswordCredentials(username, password));
+                httpClientBuilder.setDefaultCredentialsProvider(cp);
+            }
+            return httpClientBuilder;
+        });
+
+        this.restClient = builder.build();
+
         ElasticsearchTransport transport =
             new RestClientTransport(restClient, new JacksonJsonpMapper());
         this.esClient = new ElasticsearchClient(transport);
@@ -90,6 +119,24 @@ public class ElasticsearchSink implements Closeable {
         } catch (IOException e) {
             LOG.warn("Error closing Elasticsearch REST client: {}", e.getMessage());
             throw e;
+        }
+    }
+
+    private static SSLContext buildSslContext(String truststorePath, String truststorePassword) {
+        try {
+            KeyStore truststore = KeyStore.getInstance("JKS");
+            char[] password = truststorePassword != null ? truststorePassword.toCharArray() : null;
+            try (FileInputStream fis = new FileInputStream(truststorePath)) {
+                truststore.load(fis, password);
+            }
+            TrustManagerFactory tmf = TrustManagerFactory.getInstance(
+                TrustManagerFactory.getDefaultAlgorithm());
+            tmf.init(truststore);
+            SSLContext sslContext = SSLContext.getInstance("TLS");
+            sslContext.init(null, tmf.getTrustManagers(), null);
+            return sslContext;
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to build SSLContext from truststore: " + truststorePath, e);
         }
     }
 }
