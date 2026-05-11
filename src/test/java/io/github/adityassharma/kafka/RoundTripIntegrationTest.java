@@ -3,6 +3,7 @@ package io.github.adityassharma.kafka;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.clients.producer.RecordMetadata;
@@ -16,9 +17,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
 /**
  * Integration test: produce synthetic ISS-like JSON messages to Kafka, then
@@ -104,16 +105,27 @@ class RoundTripIntegrationTest {
         List<String> receivedValues = new ArrayList<>();
         long deadline = System.currentTimeMillis() + (POLL_TIMEOUT_SEC * 1000L);
 
+        System.out.println("  Consumer assignment: " + consumer.assignment());
+        System.out.println("  Consumer positions:  " +
+            consumer.assignment().stream()
+                .collect(Collectors.toMap(tp -> tp, consumer::position)));
+
         while (receivedValues.size() < NUM_MESSAGES
                && System.currentTimeMillis() < deadline) {
 
-            ConsumerRecords<String, String> records =
-                consumer.poll(Duration.ofSeconds(2));
+            try {
+                ConsumerRecords<String, String> records =
+                    consumer.poll(Duration.ofSeconds(2));
 
-            for (ConsumerRecord<String, String> r : records) {
-                receivedValues.add(r.value());
-                System.out.printf("  Received: topic=%s partition=%d offset=%d value=%s%n",
-                    r.topic(), r.partition(), r.offset(), r.value());
+                System.out.printf("  poll() returned %d record(s)%n", records.count());
+                for (ConsumerRecord<String, String> r : records) {
+                    receivedValues.add(r.value());
+                    System.out.printf("  Received: topic=%s partition=%d offset=%d value=%s%n",
+                        r.topic(), r.partition(), r.offset(), r.value());
+                }
+            } catch (Exception e) {
+                System.err.println("  poll() threw exception: " + e);
+                throw e;
             }
         }
 
@@ -154,17 +166,27 @@ class RoundTripIntegrationTest {
             "org.apache.kafka.common.serialization.StringDeserializer");
         props.put("value.deserializer",
             "org.apache.kafka.common.serialization.StringDeserializer");
-        props.put("auto.offset.reset", "latest");  // pick up only messages sent during this test
+        props.put("auto.offset.reset", "latest");
         props.put("enable.auto.commit", "true");
         props.put("max.poll.records", "100");
 
         KafkaConsumer<String, String> c = new KafkaConsumer<>(props);
-        // Subscribe (group-managed assignment) — simplest for an integration test
-        c.subscribe(Collections.singletonList(TOPIC));
 
-        // Trigger a dummy poll so the group joins and assignment is made;
-        // this ensures we are positioned correctly before the producer sends.
-        c.poll(Duration.ofSeconds(3));
+        // Manual assign + seekToEnd avoids the async group-rebalance race:
+        // subscribe() hands partition assignment to the coordinator asynchronously,
+        // so a timed dummy poll may return before partitions are assigned and the
+        // consumer would miss messages sent immediately after setUp() returns.
+        // assign() is synchronous; seekToEnd() positions each partition at the
+        // current end; position() forces the lazy seek to resolve before the
+        // producer sends anything.
+        List<TopicPartition> partitions = c.partitionsFor(TOPIC).stream()
+            .map(p -> new TopicPartition(TOPIC, p.partition()))
+            .collect(Collectors.toList());
+        System.out.println("  Assigning partitions: " + partitions);
+        c.assign(partitions);
+        c.seekToEnd(partitions);
+        partitions.forEach(tp ->
+            System.out.printf("  Seeked %s to end offset %d%n", tp, c.position(tp)));
         return c;
     }
 
