@@ -1,7 +1,12 @@
 package io.github.adityassharma.kafka.producer;
 
 import io.github.adityassharma.kafka.common.AppProperties;
+import io.github.adityassharma.kafka.common.AvroConverter;
 import io.github.adityassharma.kafka.common.KafkaClientFactory;
+import io.github.adityassharma.kafka.common.MessageFormat;
+import io.github.adityassharma.kafka.common.SchemaLoader;
+import org.apache.avro.Schema;
+import org.apache.avro.generic.GenericRecord;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -11,6 +16,7 @@ import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
 
 /**
  * Entry point for the multi-threaded Kafka producer.
@@ -23,18 +29,18 @@ import java.util.concurrent.TimeUnit;
  *       +-- [shared] DataFetcher    (thread-safe HTTP client)
  *       |
  *       +-- ProducerWorker-0  (polls ISS position API)
- *       +-- ProducerWorker-1  (polls People in Space API)
  * </pre>
  *
  * <p>Because {@link KafkaProducer} is thread-safe, it is more efficient to
  * share a single instance across workers (shared send buffer, one TCP
  * connection per broker).
  *
- * <h2>Data Sources</h2>
+ * <h2>Message format</h2>
+ * <p>Controlled by {@code message.format} in the properties file:
  * <ul>
- *   <li>Thread 0 → {@code data.source.iss.position} (ISS lat/lon, ~5 s interval)</li>
- *   <li>Thread 1 → {@code data.source.people.in.space} (crew list, 5 s interval)</li>
- *   <li>Additional threads reuse existing URLs round-robin (easy to extend)</li>
+ *   <li>{@code json} (default) — raw JSON string, no schema required</li>
+ *   <li>{@code avro} + {@code message.schema.file} — Avro binary, file-based schema</li>
+ *   <li>{@code avro} + {@code message.schema.registry.url} — Avro with Confluent Schema Registry</li>
  * </ul>
  *
  * <h2>Usage</h2>
@@ -47,13 +53,12 @@ public class ProducerMain {
     private static final Logger LOG = LogManager.getLogger(ProducerMain.class);
     private static final int SHUTDOWN_TIMEOUT_SECONDS = 15;
 
-    /** URLs in priority order — worker i gets dataSources[i % dataSources.length]. */
+    /** Data source URL property keys, assigned to workers round-robin. */
     private static final String[] DATA_SOURCE_KEYS = {
-        "data.source.iss.position",
-        "data.source.people.in.space"
+        "data.source.iss.position"
     };
 
-    public static void main(String[] args) throws InterruptedException {
+    static void main(String[] args) throws InterruptedException {
 
         // ---------------------------------------------------------------
         // 1.  Load configuration
@@ -66,42 +71,56 @@ public class ProducerMain {
         AppProperties appProps = AppProperties.load(args[0]);
         System.setProperty("app.log.dir", appProps.get("app.log.dir", "logs"));
 
-        String topicName       = appProps.getRequired("topic.name");
-        int    numThreads      = appProps.getRequiredInt("num.producer.threads");
-        long   pollingInterval = appProps.getLong("polling.interval.ms", 5000);
+        String        topicName       = appProps.getRequired("topic.name");
+        int           numThreads      = appProps.getRequiredInt("num.producer.threads");
+        long          pollingInterval = appProps.getLong("polling.interval.ms", 5000);
+        MessageFormat format          = MessageFormat.from(appProps.get("message.format", "json"));
 
-        LOG.info("ProducerMain starting. topic={} threads={} interval={}ms",
-            topicName, numThreads, pollingInterval);
-
-        // ---------------------------------------------------------------
-        // 2.  Build shared resources
-        // ---------------------------------------------------------------
-        KafkaProducer<String, String> sharedProducer =
-            KafkaClientFactory.createProducer(appProps);
-        DataFetcher sharedFetcher = new DataFetcher();
+        LOG.info("ProducerMain starting. topic={} threads={} interval={}ms format={}",
+            topicName, numThreads, pollingInterval, format);
 
         // ---------------------------------------------------------------
-        // 3.  Create and start worker threads
+        // 2.  Build shared resources — producer type depends on format
         // ---------------------------------------------------------------
-        List<ProducerWorker> workers = new ArrayList<>();
-        ExecutorService executor     = Executors.newFixedThreadPool(numThreads);
+        DataFetcher       sharedFetcher  = new DataFetcher();
+        ExecutorService   executor       = Executors.newFixedThreadPool(numThreads);
+        List<ProducerWorker<?>> workers  = new ArrayList<>();
+        KafkaProducer<?, ?>     sharedProducer;
 
-        for (int i = 0; i < numThreads; i++) {
-            // Assign a URL; cycle if more threads than URLs
-            String urlKey = DATA_SOURCE_KEYS[i % DATA_SOURCE_KEYS.length];
-            String url    = appProps.getRequired(urlKey);
+        if (format == MessageFormat.JSON) {
+            KafkaProducer<String, String> p = KafkaClientFactory.createProducer(appProps);
+            sharedProducer = p;
+            buildAndStartWorkers(appProps, topicName, numThreads, pollingInterval,
+                p, sharedFetcher, Function.identity(), workers, executor);
 
-            ProducerWorker worker = new ProducerWorker(
-                i, url, topicName, pollingInterval, sharedProducer, sharedFetcher);
-            workers.add(worker);
-            executor.submit(worker);
+        } else {
+            // Avro: choose file-based schema or Schema Registry
+            String registryUrl = appProps.getRawProperties().getProperty("message.schema.registry.url");
+            if (registryUrl != null && !registryUrl.isBlank()) {
+                KafkaProducer<String, GenericRecord> p =
+                    KafkaClientFactory.createSchemaRegistryProducer(appProps);
+                sharedProducer = p;
+                // Schema is managed by the registry; converter parses ISS JSON to GenericRecord
+                // using the schema pre-registered under the topic's subject.
+                Schema schema = SchemaLoader.fromFile(appProps);
+                buildAndStartWorkers(appProps, topicName, numThreads, pollingInterval,
+                    p, sharedFetcher, json -> AvroConverter.fromJson(json, schema), workers, executor);
+            } else {
+                Schema schema = SchemaLoader.fromFile(appProps);
+                KafkaProducer<String, GenericRecord> p =
+                    KafkaClientFactory.createAvroProducer(appProps, schema);
+                sharedProducer = p;
+                buildAndStartWorkers(appProps, topicName, numThreads, pollingInterval,
+                    p, sharedFetcher, json -> AvroConverter.fromJson(json, schema), workers, executor);
+            }
         }
 
         LOG.info("All {} producer worker(s) started.", numThreads);
 
         // ---------------------------------------------------------------
-        // 4.  Shutdown hook
+        // 3.  Shutdown hook
         // ---------------------------------------------------------------
+        final KafkaProducer<?, ?> producerRef = sharedProducer;
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             LOG.info("Shutdown hook triggered. Stopping {} producer worker(s)...", workers.size());
 
@@ -119,16 +138,14 @@ public class ProducerMain {
                 executor.shutdownNow();
             }
 
-            // Flush and close shared Kafka producer
             try {
-                sharedProducer.flush();
-                sharedProducer.close();
+                producerRef.flush();
+                producerRef.close();
                 LOG.info("KafkaProducer closed.");
             } catch (Exception e) {
                 LOG.warn("Error closing KafkaProducer: {}", e.getMessage());
             }
 
-            // Close HTTP client
             try {
                 sharedFetcher.close();
             } catch (Exception e) {
@@ -139,8 +156,33 @@ public class ProducerMain {
         }, "shutdown-hook"));
 
         // ---------------------------------------------------------------
-        // 5.  Keep main thread alive
+        // 4.  Keep main thread alive
         // ---------------------------------------------------------------
-        executor.awaitTermination(Long.MAX_VALUE, TimeUnit.DAYS);
+        Thread.currentThread().join();
+    }
+
+    // -----------------------------------------------------------------------
+    // Helper — typed so the compiler verifies producer/converter/worker alignment
+    // -----------------------------------------------------------------------
+
+    private static <V> void buildAndStartWorkers(
+            AppProperties appProps,
+            String topicName,
+            int numThreads,
+            long pollingIntervalMs,
+            KafkaProducer<String, V> producer,
+            DataFetcher fetcher,
+            Function<String, V> converter,
+            List<ProducerWorker<?>> workers,
+            ExecutorService executor) {
+
+        for (int i = 0; i < numThreads; i++) {
+            String urlKey = DATA_SOURCE_KEYS[i % DATA_SOURCE_KEYS.length];
+            String url    = appProps.getRequired(urlKey);
+            ProducerWorker<V> worker = new ProducerWorker<>(
+                i, url, topicName, pollingIntervalMs, producer, fetcher, converter);
+            workers.add(worker);
+            executor.submit(worker);
+        }
     }
 }
