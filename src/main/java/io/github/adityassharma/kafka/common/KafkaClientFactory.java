@@ -9,6 +9,7 @@ import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.common.config.SaslConfigs;
 import org.apache.kafka.common.config.SslConfigs;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
@@ -198,6 +199,11 @@ public final class KafkaClientFactory {
         // Set security.protocol=SSL for one-way TLS (truststore only).
         // Add ssl.keystore.* properties to enable mTLS (mutual TLS).
         copySslProps(target, src);
+
+        // SASL authentication — forwarded only when present in the properties file.
+        // Set security.protocol=SASL_PLAINTEXT or SASL_SSL and provide
+        // sasl.mechanism + sasl.jaas.config for username/password auth.
+        copySaslProps(target, src);
     }
 
     private static void copyKafkaProducerProps(Properties target, AppProperties src) {
@@ -237,6 +243,11 @@ public final class KafkaClientFactory {
         // Set security.protocol=SSL for one-way TLS (truststore only).
         // Add ssl.keystore.* properties to enable mTLS (mutual TLS).
         copySslProps(target, src);
+
+        // SASL authentication — forwarded only when present in the properties file.
+        // Set security.protocol=SASL_PLAINTEXT or SASL_SSL and provide
+        // sasl.mechanism + sasl.jaas.config for username/password auth.
+        copySaslProps(target, src);
     }
 
     private static void copySslProps(Properties target, AppProperties src) {
@@ -247,6 +258,20 @@ public final class KafkaClientFactory {
         copyOptional(target, src, SslConfigs.SSL_KEYSTORE_PASSWORD_CONFIG);
         copyOptional(target, src, SslConfigs.SSL_KEY_PASSWORD_CONFIG);
         copyOptional(target, src, SslConfigs.SSL_ENDPOINT_IDENTIFICATION_ALGORITHM_CONFIG);
+    }
+
+    private static void copySaslProps(Properties target, AppProperties src) {
+        // Core SASL properties — required for any SASL mechanism
+        copyOptional(target, src, SaslConfigs.SASL_MECHANISM);
+        copyOptional(target, src, SaslConfigs.SASL_JAAS_CONFIG);
+
+        // Kerberos (GSSAPI) — only needed when sasl.mechanism=GSSAPI
+        copyOptional(target, src, SaslConfigs.SASL_KERBEROS_SERVICE_NAME);
+
+        // Custom callback handler classes — advanced / optional
+        copyOptional(target, src, SaslConfigs.SASL_CLIENT_CALLBACK_HANDLER_CLASS);
+        copyOptional(target, src, SaslConfigs.SASL_LOGIN_CALLBACK_HANDLER_CLASS);
+        copyOptional(target, src, SaslConfigs.SASL_LOGIN_CLASS);
     }
 
     private static void copyRequired(Properties target, AppProperties src, String key) {
