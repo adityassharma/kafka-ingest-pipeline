@@ -14,6 +14,9 @@ import org.apache.logging.log4j.Logger;
 import org.elasticsearch.client.RestClient;
 import org.elasticsearch.client.RestClientBuilder;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManagerFactory;
 import java.io.Closeable;
@@ -21,6 +24,7 @@ import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.StringReader;
 import java.security.KeyStore;
+import java.time.Instant;
 
 /**
  * Thread-safe wrapper around the Elasticsearch Java client.
@@ -34,6 +38,8 @@ import java.security.KeyStore;
 public class ElasticsearchSink implements Closeable {
 
     private static final Logger LOG = LogManager.getLogger(ElasticsearchSink.class);
+
+    private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private final ElasticsearchClient esClient;
     private final RestClient restClient;
@@ -97,10 +103,11 @@ public class ElasticsearchSink implements Closeable {
      */
     public void index(String docId, String jsonDoc) {
         try {
+            String enriched = injectRecordTimestamp(jsonDoc);
             IndexResponse response = esClient.index(i -> i
                 .index(indexName)
                 .id(docId)
-                .withJson(new StringReader(jsonDoc))
+                .withJson(new StringReader(enriched))
             );
             LOG.debug("Indexed doc id={} result={} index={}",
                 response.id(), response.result().jsonValue(), indexName);
@@ -108,6 +115,24 @@ public class ElasticsearchSink implements Closeable {
             LOG.error("Failed to index document id={}: {}", docId, e.getMessage(), e);
             // Do not re-throw — allow the consumer thread to continue processing
             // subsequent messages. Consider a dead-letter queue for production.
+        }
+    }
+
+    // Adds recordTimestamp (ISO-8601) derived from the epoch-second timestamp field.
+    // If timestamp is absent or not a number the document is returned unchanged.
+    private static String injectRecordTimestamp(String jsonDoc) {
+        try {
+            ObjectNode node = (ObjectNode) MAPPER.readTree(jsonDoc);
+            if (node.has("timestamp") && node.get("timestamp").isNumber()) {
+                long epochSeconds = node.get("timestamp").asLong();
+                node.put("recordTimestamp", Instant.ofEpochSecond(epochSeconds).toString());
+            } else {
+                LOG.warn("timestamp field absent or non-numeric — recordTimestamp not added");
+            }
+            return MAPPER.writeValueAsString(node);
+        } catch (Exception e) {
+            LOG.warn("Failed to inject recordTimestamp, forwarding original document: {}", e.getMessage());
+            return jsonDoc;
         }
     }
 
