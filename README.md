@@ -426,9 +426,13 @@ Both producer and consumer accept a single argument: the path to their propertie
 ### Producer
 
 ```bash
+# Linux/macOS
 java -cp target/kafka-ingest-pipeline-1.0.0-fat.jar \
   io.github.adityassharma.kafka.producer.ProducerMain \
   config/producer.properties
+
+# Windows
+java -cp target\kafka-ingest-pipeline-1.0.0-fat.jar io.github.adityassharma.kafka.producer.ProducerMain config\producer.properties
 ```
 
 Each worker thread polls the ISS position API every `polling.interval.ms` milliseconds
@@ -441,9 +445,13 @@ messages, closes cleanly, then exits.
 ### Consumer
 
 ```bash
+# Linux/macOS
 java -cp target/kafka-ingest-pipeline-1.0.0-fat.jar \
   io.github.adityassharma.kafka.consumer.ConsumerMain \
   config/consumer.properties
+
+# Windows
+java -cp target\kafka-ingest-pipeline-1.0.0-fat.jar io.github.adityassharma.kafka.consumer.ConsumerMain config\consumer.properties
 ```
 
 Each worker thread owns its own `KafkaConsumer` (not thread-safe; never shared),
