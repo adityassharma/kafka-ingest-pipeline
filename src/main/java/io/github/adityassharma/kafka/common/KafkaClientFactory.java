@@ -1,12 +1,20 @@
 package io.github.adityassharma.kafka.common;
 
+import io.confluent.kafka.serializers.KafkaAvroDeserializer;
+import io.confluent.kafka.serializers.KafkaAvroSerializer;
+import org.apache.avro.Schema;
+import org.apache.avro.generic.GenericRecord;
 import org.apache.kafka.clients.CommonClientConfigs;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.common.config.SaslConfigs;
 import org.apache.kafka.common.config.SslConfigs;
+import org.apache.kafka.common.serialization.StringDeserializer;
+import org.apache.kafka.common.serialization.StringSerializer;
 
+import java.util.Map;
 import java.util.Properties;
 
 /**
@@ -23,62 +31,133 @@ import java.util.Properties;
  * KafkaConsumer is NOT thread-safe and must not be shared across threads.
  * KafkaProducer IS thread-safe and can be shared, but this factory creates
  * one per thread for isolation and clean shutdown semantics.
+ *
+ * <h2>Format support</h2>
+ * <ul>
+ *   <li>{@link #createProducer} / {@link #createConsumer} — JSON (String value)</li>
+ *   <li>{@link #createAvroProducer} / {@link #createAvroConsumer} — Avro binary,
+ *       file-based schema, no Schema Registry required</li>
+ *   <li>{@link #createSchemaRegistryProducer} / {@link #createSchemaRegistryConsumer}
+ *       — Avro with Confluent Schema Registry</li>
+ * </ul>
  */
 public final class KafkaClientFactory {
 
     private KafkaClientFactory() {}
 
     // -----------------------------------------------------------------------
-    // Consumer
+    // JSON (String) — existing behaviour unchanged
     // -----------------------------------------------------------------------
 
     /**
-     * Build a {@link KafkaConsumer} of type {@code KafkaConsumer<String, String>} from the supplied properties.
-     *
-     * <p>The following keys are read from the properties file:
-     * <ul>
-     *   <li>bootstrap.servers (required)</li>
-     *   <li>group.id (required)</li>
-     *   <li>key.deserializer / value.deserializer</li>
-     *   <li>auto.offset.reset, enable.auto.commit, auto.commit.interval.ms</li>
-     *   <li>session.timeout.ms, heartbeat.interval.ms</li>
-     *   <li>max.poll.records, max.poll.interval.ms</li>
-     *   <li>fetch.min.bytes, fetch.max.wait.ms, max.partition.fetch.bytes</li>
-     * </ul>
-     */
-    public static KafkaConsumer<String, String> createConsumer(AppProperties appProps) {
-        Properties kafkaProps = new Properties();
-
-        // Copy all standard Kafka consumer properties by passing them directly.
-        // The consumer client ignores unknown keys, so it is safe to pass the
-        // entire properties file — no filtering needed.
-        copyKafkaConsumerProps(kafkaProps, appProps);
-
-        return new KafkaConsumer<>(kafkaProps);
-    }
-
-    // -----------------------------------------------------------------------
-    // Producer
-    // -----------------------------------------------------------------------
-
-    /**
-     * Build a {@link KafkaProducer} of type {@code KafkaProducer<String, String>} from the supplied properties.
-     *
-     * <p>The following keys are read from the properties file:
-     * <ul>
-     *   <li>bootstrap.servers (required)</li>
-     *   <li>key.serializer / value.serializer</li>
-     *   <li>acks, retries, retry.backoff.ms</li>
-     *   <li>batch.size, linger.ms, buffer.memory</li>
-     *   <li>compression.type</li>
-     *   <li>request.timeout.ms, delivery.timeout.ms, max.block.ms</li>
-     *   <li>enable.idempotence</li>
-     * </ul>
+     * Build a {@link KafkaProducer} of type {@code KafkaProducer<String, String>}.
      */
     public static KafkaProducer<String, String> createProducer(AppProperties appProps) {
         Properties kafkaProps = new Properties();
         copyKafkaProducerProps(kafkaProps, appProps);
         return new KafkaProducer<>(kafkaProps);
+    }
+
+    /**
+     * Build a {@link KafkaConsumer} of type {@code KafkaConsumer<String, String>}.
+     */
+    public static KafkaConsumer<String, String> createConsumer(AppProperties appProps) {
+        Properties kafkaProps = new Properties();
+        copyKafkaConsumerProps(kafkaProps, appProps);
+        return new KafkaConsumer<>(kafkaProps);
+    }
+
+    // -----------------------------------------------------------------------
+    // Avro — file-based schema, no Schema Registry
+    // -----------------------------------------------------------------------
+
+    /**
+     * Build a {@link KafkaProducer} of type {@code KafkaProducer<String, GenericRecord>}
+     * using Avro binary encoding with the supplied file-based schema.
+     *
+     * <p>Pair with {@link #createAvroConsumer} using the same schema file.
+     */
+    public static KafkaProducer<String, GenericRecord> createAvroProducer(
+            AppProperties appProps, Schema schema) {
+        Properties kafkaProps = new Properties();
+        copyKafkaProducerProps(kafkaProps, appProps);
+        // Remove class-name serializer entries — we pass instances directly below
+        kafkaProps.remove(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG);
+        kafkaProps.remove(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG);
+        return new KafkaProducer<>(kafkaProps,
+            new StringSerializer(),
+            new AvroFileSerializer(schema));
+    }
+
+    /**
+     * Build a {@link KafkaConsumer} of type {@code KafkaConsumer<String, GenericRecord>}
+     * using Avro binary decoding with the supplied file-based schema.
+     *
+     * <p>Pair with {@link #createAvroProducer} using the same schema file.
+     */
+    public static KafkaConsumer<String, GenericRecord> createAvroConsumer(
+            AppProperties appProps, Schema schema) {
+        Properties kafkaProps = new Properties();
+        copyKafkaConsumerProps(kafkaProps, appProps);
+        kafkaProps.remove(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG);
+        kafkaProps.remove(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG);
+        return new KafkaConsumer<>(kafkaProps,
+            new StringDeserializer(),
+            new AvroFileDeserializer(schema));
+    }
+
+    // -----------------------------------------------------------------------
+    // Avro — Confluent Schema Registry
+    // -----------------------------------------------------------------------
+
+    /**
+     * Build a {@link KafkaProducer} of type {@code KafkaProducer<String, GenericRecord>}
+     * using Confluent's {@code KafkaAvroSerializer}.  The schema is registered/fetched
+     * from the registry automatically.
+     *
+     * <p>Requires {@code message.schema.registry.url} in the properties file.
+     */
+    @SuppressWarnings("resource") // avroSer lifetime is tied to the returned producer; closing it early would break serialization
+    public static KafkaProducer<String, GenericRecord> createSchemaRegistryProducer(
+            AppProperties appProps) {
+        String registryUrl = appProps.getRequired("message.schema.registry.url");
+        Properties kafkaProps = new Properties();
+        copyKafkaProducerProps(kafkaProps, appProps);
+        kafkaProps.remove(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG);
+        kafkaProps.remove(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG);
+
+        KafkaAvroSerializer avroSer = new KafkaAvroSerializer();
+        avroSer.configure(Map.of("schema.registry.url", registryUrl), false /* isKey */);
+
+        return new KafkaProducer<>(kafkaProps,
+            new StringSerializer(),
+            avroSer::serialize);
+    }
+
+    /**
+     * Build a {@link KafkaConsumer} of type {@code KafkaConsumer<String, GenericRecord>}
+     * using Confluent's {@code KafkaAvroDeserializer} in generic (non-specific) mode.
+     *
+     * <p>Requires {@code message.schema.registry.url} in the properties file.
+     */
+    @SuppressWarnings("resource") // avroDes lifetime is tied to the returned consumer; closing it early would break deserialization
+    public static KafkaConsumer<String, GenericRecord> createSchemaRegistryConsumer(
+            AppProperties appProps) {
+        String registryUrl = appProps.getRequired("message.schema.registry.url");
+        Properties kafkaProps = new Properties();
+        copyKafkaConsumerProps(kafkaProps, appProps);
+        kafkaProps.remove(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG);
+        kafkaProps.remove(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG);
+
+        KafkaAvroDeserializer avroDes = new KafkaAvroDeserializer();
+        avroDes.configure(
+            Map.of("schema.registry.url", registryUrl,
+                   "specific.avro.reader", false),
+            false /* isKey */);
+
+        return new KafkaConsumer<>(kafkaProps,
+            new StringDeserializer(),
+            (topic, data) -> (GenericRecord) avroDes.deserialize(topic, data));
     }
 
     // -----------------------------------------------------------------------
@@ -120,6 +199,11 @@ public final class KafkaClientFactory {
         // Set security.protocol=SSL for one-way TLS (truststore only).
         // Add ssl.keystore.* properties to enable mTLS (mutual TLS).
         copySslProps(target, src);
+
+        // SASL authentication — forwarded only when present in the properties file.
+        // Set security.protocol=SASL_PLAINTEXT or SASL_SSL and provide
+        // sasl.mechanism + sasl.jaas.config for username/password auth.
+        copySaslProps(target, src);
     }
 
     private static void copyKafkaProducerProps(Properties target, AppProperties src) {
@@ -159,6 +243,11 @@ public final class KafkaClientFactory {
         // Set security.protocol=SSL for one-way TLS (truststore only).
         // Add ssl.keystore.* properties to enable mTLS (mutual TLS).
         copySslProps(target, src);
+
+        // SASL authentication — forwarded only when present in the properties file.
+        // Set security.protocol=SASL_PLAINTEXT or SASL_SSL and provide
+        // sasl.mechanism + sasl.jaas.config for username/password auth.
+        copySaslProps(target, src);
     }
 
     private static void copySslProps(Properties target, AppProperties src) {
@@ -169,6 +258,20 @@ public final class KafkaClientFactory {
         copyOptional(target, src, SslConfigs.SSL_KEYSTORE_PASSWORD_CONFIG);
         copyOptional(target, src, SslConfigs.SSL_KEY_PASSWORD_CONFIG);
         copyOptional(target, src, SslConfigs.SSL_ENDPOINT_IDENTIFICATION_ALGORITHM_CONFIG);
+    }
+
+    private static void copySaslProps(Properties target, AppProperties src) {
+        // Core SASL properties — required for any SASL mechanism
+        copyOptional(target, src, SaslConfigs.SASL_MECHANISM);
+        copyOptional(target, src, SaslConfigs.SASL_JAAS_CONFIG);
+
+        // Kerberos (GSSAPI) — only needed when sasl.mechanism=GSSAPI
+        copyOptional(target, src, SaslConfigs.SASL_KERBEROS_SERVICE_NAME);
+
+        // Custom callback handler classes — advanced / optional
+        copyOptional(target, src, SaslConfigs.SASL_CLIENT_CALLBACK_HANDLER_CLASS);
+        copyOptional(target, src, SaslConfigs.SASL_LOGIN_CALLBACK_HANDLER_CLASS);
+        copyOptional(target, src, SaslConfigs.SASL_LOGIN_CLASS);
     }
 
     private static void copyRequired(Properties target, AppProperties src, String key) {

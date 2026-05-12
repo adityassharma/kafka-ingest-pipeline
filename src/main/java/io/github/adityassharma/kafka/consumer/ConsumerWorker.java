@@ -2,7 +2,6 @@ package io.github.adityassharma.kafka.consumer;
 
 import io.github.adityassharma.kafka.common.AppProperties;
 import io.github.adityassharma.kafka.common.ElasticsearchSink;
-import io.github.adityassharma.kafka.common.KafkaClientFactory;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
@@ -13,44 +12,63 @@ import org.apache.logging.log4j.Logger;
 import java.time.Duration;
 import java.util.Collections;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Function;
+import java.util.function.Supplier;
 
 /**
- * A single consumer worker thread.
+ * A single consumer worker thread, generic over the Kafka message value type {@code V}.
  *
- * <p>Design decisions:
+ * <h2>Design decisions</h2>
  * <ul>
- *   <li>Each worker owns exactly one {@link KafkaConsumer} — KafkaConsumer is
- *       NOT thread-safe and must never be shared.</li>
+ *   <li>Each worker owns exactly one {@link KafkaConsumer} — KafkaConsumer is NOT
+ *       thread-safe and must never be shared.  The consumer is created lazily inside
+ *       {@link #run()} via the injected {@code consumerSupplier}.</li>
  *   <li>Each worker subscribes to the topic via the consumer-group protocol
- *       ({@code KafkaConsumer.subscribe()}).  The broker's group coordinator
- *       assigns partitions via rebalance, allowing dynamic scaling without
- *       restarts.</li>
- *   <li>Offsets are committed synchronously after every poll batch to avoid
- *       re-processing on restart.  For higher throughput, switch to
- *       {@code commitAsync()} with a callback.</li>
- *   <li>The worker indexes each record to Elasticsearch via
- *       {@link ElasticsearchSink}.</li>
+ *       ({@code KafkaConsumer.subscribe()}).  The broker's group coordinator assigns
+ *       partitions via rebalance, allowing dynamic scaling without restarts.</li>
+ *   <li>Before indexing to Elasticsearch, the value {@code V} is converted to a JSON
+ *       string by the injected {@code toJson} function.
+ *       {@link ElasticsearchSink} always receives a plain JSON string.</li>
+ *   <li>Offsets are committed synchronously after every poll batch.</li>
  * </ul>
  *
+ * <h2>Format wiring</h2>
+ * <ul>
+ *   <li>JSON: {@code V = String}, toJson = {@code Function.identity()}</li>
+ *   <li>Avro: {@code V = GenericRecord}, toJson = {@code AvroConverter::toJson}</li>
+ * </ul>
+ *
+ * <p>Wiring is done by {@link ConsumerMain}, which detects {@code message.format} and
+ * injects the appropriate supplier and toJson function.
+ *
  * <p>Graceful shutdown: call {@link #shutdown()}, which triggers
- * {@link KafkaConsumer#wakeup()} to interrupt the blocking {@code poll()} and
- * sets the stop flag so the loop exits cleanly.
+ * {@link KafkaConsumer#wakeup()} to interrupt the blocking {@code poll()}.
+ *
+ * @param <V> Kafka message value type (String for JSON, GenericRecord for Avro)
  */
-public class ConsumerWorker implements Runnable {
+public class ConsumerWorker<V> implements Runnable {
 
     private static final Logger LOG = LogManager.getLogger(ConsumerWorker.class);
 
     private final int workerId;
     private final String topicName;
+    private final Supplier<KafkaConsumer<String, V>> consumerSupplier;
+    private final Function<V, String> toJson;
     private final AppProperties appProps;
     private final AtomicBoolean running = new AtomicBoolean(true);
 
-    private KafkaConsumer<String, String> consumer;
+    private KafkaConsumer<String, V> consumer;
 
-    public ConsumerWorker(int workerId, String topicName, AppProperties appProps) {
-        this.workerId  = workerId;
-        this.topicName = topicName;
-        this.appProps  = appProps;
+    public ConsumerWorker(int workerId,
+                          String topicName,
+                          Supplier<KafkaConsumer<String, V>> consumerSupplier,
+                          Function<V, String> toJson,
+                          AppProperties appProps) {
+        this.workerId         = workerId;
+        this.topicName        = topicName;
+        this.consumerSupplier = consumerSupplier;
+        this.toJson           = toJson;
+        this.appProps         = appProps;
     }
 
     @Override
@@ -58,7 +76,7 @@ public class ConsumerWorker implements Runnable {
         Thread.currentThread().setName("consumer-worker-" + workerId);
         LOG.info("Worker {} starting. Subscribing to topic: {}", workerId, topicName);
 
-        consumer = KafkaClientFactory.createConsumer(appProps);
+        consumer = consumerSupplier.get();
         consumer.subscribe(Collections.singletonList(topicName));
 
         try (ElasticsearchSink esSink = new ElasticsearchSink(appProps)) {
@@ -67,7 +85,7 @@ public class ConsumerWorker implements Runnable {
                 appProps.getLong("fetch.max.wait.ms", 500));
 
             while (running.get()) {
-                ConsumerRecords<String, String> records;
+                ConsumerRecords<String, V> records;
                 try {
                     records = consumer.poll(pollTimeout);
                 } catch (WakeupException e) {
@@ -82,7 +100,7 @@ public class ConsumerWorker implements Runnable {
 
                 LOG.debug("Worker {} polled {} records.", workerId, records.count());
 
-                for (ConsumerRecord<String, String> record : records) {
+                for (ConsumerRecord<String, V> record : records) {
                     processRecord(record, esSink);
                 }
 
@@ -101,22 +119,23 @@ public class ConsumerWorker implements Runnable {
     }
 
     /**
-     * Process a single Kafka record: log it and send to Elasticsearch.
+     * Process a single Kafka record: convert value to JSON, log it, and send to Elasticsearch.
      */
-    private void processRecord(ConsumerRecord<String, String> record,
-                               ElasticsearchSink esSink) {
+    private void processRecord(ConsumerRecord<String, V> record, ElasticsearchSink esSink) {
+        String jsonValue = toJson.apply(record.value());
+
         LOG.info("Worker {} | topic={} partition={} offset={} key={} value={}",
             workerId,
             record.topic(),
             record.partition(),
             record.offset(),
             record.key(),
-            record.value());
+            jsonValue);
 
         // Use "topic-partition-offset" as document ID — guarantees idempotent
         // indexing (re-processing the same record produces the same doc ID).
         String docId = record.topic() + "-" + record.partition() + "-" + record.offset();
-        esSink.index(docId, record.value());
+        esSink.index(docId, jsonValue);
     }
 
     /**
