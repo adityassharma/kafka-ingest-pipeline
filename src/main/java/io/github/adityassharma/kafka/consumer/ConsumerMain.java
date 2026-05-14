@@ -2,6 +2,7 @@ package io.github.adityassharma.kafka.consumer;
 
 import io.github.adityassharma.kafka.common.AppProperties;
 import io.github.adityassharma.kafka.common.AvroConverter;
+import io.github.adityassharma.kafka.common.ElasticsearchSink;
 import io.github.adityassharma.kafka.common.KafkaClientFactory;
 import io.github.adityassharma.kafka.common.MessageFormat;
 import io.github.adityassharma.kafka.common.SchemaLoader;
@@ -24,6 +25,8 @@ import java.util.function.Supplier;
  * <h2>Threading Model</h2>
  * <pre>
  *   ConsumerMain
+ *       |
+ *       +-- [shared] ElasticsearchSink  (thread-safe RestClient, one connection pool)
  *       |
  *       +-- ConsumerWorker-0  (owns KafkaConsumer, subscribed via group rebalance)
  *       +-- ConsumerWorker-1  (owns KafkaConsumer, subscribed via group rebalance)
@@ -67,38 +70,43 @@ public class ConsumerMain {
         int           numThreads = appProps.getRequiredInt("num.consumer.threads");
         MessageFormat format     = MessageFormat.from(appProps.get("message.format", "json"));
 
+        long pollTimeoutMs = appProps.getLong("fetch.max.wait.ms", 500);
+
         LOG.info("ConsumerMain starting. topic={} threads={} format={}",
             topicName, numThreads, format);
 
         // ---------------------------------------------------------------
-        // 2.  Create worker threads — supplier + toJson depend on format
+        // 2.  Create shared resources and worker threads
+        //     ElasticsearchSink is shared: RestClient is thread-safe and
+        //     maintains one connection pool across all consumer threads.
         // ---------------------------------------------------------------
-        ExecutorService      executor = Executors.newFixedThreadPool(numThreads);
+        ElasticsearchSink    sharedSink = new ElasticsearchSink(appProps);
+        ExecutorService      executor   = Executors.newFixedThreadPool(numThreads);
         List<ConsumerWorker<?>> workers;
 
         if (format == MessageFormat.JSON) {
             workers = buildConsumerWorkers(
-                appProps, topicName, numThreads,
+                topicName, numThreads,
                 () -> KafkaClientFactory.createConsumer(appProps),
                 Function.identity(),
-                executor);
+                sharedSink, pollTimeoutMs, executor);
 
         } else {
             // Avro: choose file-based schema or Schema Registry
             String registryUrl = appProps.getRawProperties().getProperty("message.schema.registry.url");
             if (registryUrl != null && !registryUrl.isBlank()) {
                 workers = buildConsumerWorkers(
-                    appProps, topicName, numThreads,
+                    topicName, numThreads,
                     () -> KafkaClientFactory.createSchemaRegistryConsumer(appProps),
                     AvroConverter::toJson,
-                    executor);
+                    sharedSink, pollTimeoutMs, executor);
             } else {
                 Schema schema = SchemaLoader.fromFile(appProps);
                 workers = buildConsumerWorkers(
-                    appProps, topicName, numThreads,
+                    topicName, numThreads,
                     () -> KafkaClientFactory.createAvroConsumer(appProps, schema),
                     AvroConverter::toJson,
-                    executor);
+                    sharedSink, pollTimeoutMs, executor);
             }
         }
 
@@ -119,6 +127,14 @@ public class ConsumerMain {
                 Thread.currentThread().interrupt();
                 executor.shutdownNow();
             }
+            // Close the shared sink after all workers have stopped — safe because
+            // no worker thread will call esSink.index() after their run() returns.
+            try {
+                sharedSink.close();
+                LOG.info("ElasticsearchSink closed.");
+            } catch (Exception e) {
+                LOG.warn("Error closing ElasticsearchSink: {}", e.getMessage());
+            }
             LOG.info("ConsumerMain shutdown complete.");
         }, "shutdown-hook"));
 
@@ -131,17 +147,18 @@ public class ConsumerMain {
     // -----------------------------------------------------------------------
 
     private static <V> List<ConsumerWorker<?>> buildConsumerWorkers(
-            AppProperties appProps,
             String topicName,
             int numThreads,
             Supplier<KafkaConsumer<String, V>> consumerSupplier,
             Function<V, String> toJson,
+            ElasticsearchSink sharedSink,
+            long pollTimeoutMs,
             ExecutorService executor) {
 
         List<ConsumerWorker<?>> workers = new ArrayList<>();
         for (int i = 0; i < numThreads; i++) {
             ConsumerWorker<V> worker = new ConsumerWorker<>(
-                i, topicName, consumerSupplier, toJson, appProps);
+                i, topicName, consumerSupplier, toJson, sharedSink, pollTimeoutMs);
             workers.add(worker);
             executor.submit(worker);
         }

@@ -1,6 +1,5 @@
 package io.github.adityassharma.kafka.consumer;
 
-import io.github.adityassharma.kafka.common.AppProperties;
 import io.github.adityassharma.kafka.common.ElasticsearchSink;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
@@ -26,6 +25,11 @@ import java.util.function.Supplier;
  *   <li>Each worker subscribes to the topic via the consumer-group protocol
  *       ({@code KafkaConsumer.subscribe()}).  The broker's group coordinator assigns
  *       partitions via rebalance, allowing dynamic scaling without restarts.</li>
+ *   <li>The {@link ElasticsearchSink} is shared across all workers and injected via
+ *       the constructor.  {@code RestClient} (the underlying HTTP client) is thread-safe
+ *       and manages a single connection pool for all threads, which is more efficient
+ *       than one pool per worker.  The sink is closed by {@link ConsumerMain}'s shutdown
+ *       hook after all workers have stopped.</li>
  *   <li>Before indexing to Elasticsearch, the value {@code V} is converted to a JSON
  *       string by the injected {@code toJson} function.
  *       {@link ElasticsearchSink} always receives a plain JSON string.</li>
@@ -54,7 +58,8 @@ public class ConsumerWorker<V> implements Runnable {
     private final String topicName;
     private final Supplier<KafkaConsumer<String, V>> consumerSupplier;
     private final Function<V, String> toJson;
-    private final AppProperties appProps;
+    private final ElasticsearchSink esSink;
+    private final long pollTimeoutMs;
     private final AtomicBoolean running = new AtomicBoolean(true);
 
     private KafkaConsumer<String, V> consumer;
@@ -63,12 +68,14 @@ public class ConsumerWorker<V> implements Runnable {
                           String topicName,
                           Supplier<KafkaConsumer<String, V>> consumerSupplier,
                           Function<V, String> toJson,
-                          AppProperties appProps) {
+                          ElasticsearchSink esSink,
+                          long pollTimeoutMs) {
         this.workerId         = workerId;
         this.topicName        = topicName;
         this.consumerSupplier = consumerSupplier;
         this.toJson           = toJson;
-        this.appProps         = appProps;
+        this.esSink           = esSink;
+        this.pollTimeoutMs    = pollTimeoutMs;
     }
 
     @Override
@@ -79,11 +86,9 @@ public class ConsumerWorker<V> implements Runnable {
         consumer = consumerSupplier.get();
         consumer.subscribe(Collections.singletonList(topicName));
 
-        try (ElasticsearchSink esSink = new ElasticsearchSink(appProps)) {
+        Duration pollTimeout = Duration.ofMillis(pollTimeoutMs);
 
-            Duration pollTimeout = Duration.ofMillis(
-                appProps.getLong("fetch.max.wait.ms", 500));
-
+        try {
             while (running.get()) {
                 ConsumerRecords<String, V> records;
                 try {
@@ -101,7 +106,7 @@ public class ConsumerWorker<V> implements Runnable {
                 LOG.debug("Worker {} polled {} records.", workerId, records.count());
 
                 for (ConsumerRecord<String, V> record : records) {
-                    processRecord(record, esSink);
+                    processRecord(record);
                 }
 
                 // Synchronous commit after processing the entire batch.
@@ -121,7 +126,7 @@ public class ConsumerWorker<V> implements Runnable {
     /**
      * Process a single Kafka record: convert value to JSON, log it, and send to Elasticsearch.
      */
-    private void processRecord(ConsumerRecord<String, V> record, ElasticsearchSink esSink) {
+    private void processRecord(ConsumerRecord<String, V> record) {
         String jsonValue = toJson.apply(record.value());
 
         LOG.info("Worker {} | topic={} partition={} offset={} key={} value={}",
