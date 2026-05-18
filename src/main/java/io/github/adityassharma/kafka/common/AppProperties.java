@@ -79,9 +79,12 @@ public final class AppProperties {
 
     /**
      * Get an optional string property with a default.
+     * Returns {@code defaultValue} (which may be null) when the key is absent or blank.
      */
     public String get(String key, String defaultValue) {
-        return props.getProperty(key, defaultValue).trim();
+        String val = props.getProperty(key);
+        if (val == null || val.isBlank()) return defaultValue;
+        return val.trim();
     }
 
     /**

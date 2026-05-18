@@ -132,8 +132,13 @@ public class SourceRunner {
                 );
             }
             case AVRO -> {
+                // message.schema.file is required on the source side even when Schema Registry
+                // is configured: sources emit plain JSON strings, and AvroConverter.fromJson()
+                // needs the schema to parse JSON → GenericRecord before the serialiser can
+                // encode or register it. The registry handles wire encoding only, not parsing.
                 Schema schema = SchemaLoader.fromFile(appProps);
-                if (appProps.get("message.schema.registry.url", null) != null) {
+                boolean useRegistry = appProps.get("message.schema.registry.url", null) != null;
+                if (useRegistry) {
                     KafkaProducer<String, GenericRecord> producer =
                         KafkaClientFactory.createSchemaRegistryProducer(appProps);
                     producersToClose.add(producer);

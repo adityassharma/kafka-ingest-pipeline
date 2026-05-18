@@ -93,8 +93,9 @@ public class SinkRunner {
             "sink." + name + ".topics is required");
 
         int numThreads = Integer.parseInt(sinkConfig.getProperty("threads", "1"));
+        int[] workerIdx = {0};
         executor = Executors.newFixedThreadPool(numThreads, r -> {
-            Thread t = new Thread(r, "sink-" + name + "-worker-" + consumers.size());
+            Thread t = new Thread(r, "sink-" + name + "-worker-" + workerIdx[0]++);
             t.setDaemon(false);
             return t;
         });
@@ -147,8 +148,11 @@ public class SinkRunner {
                 }
             }
             case AVRO -> {
-                Schema schema = SchemaLoader.fromFile(appProps);
+                // With Schema Registry the deserialiser fetches the schema from the registry
+                // and returns GenericRecord directly — no local schema file needed.
+                // With file-based Avro, the schema file is required.
                 boolean useRegistry = appProps.get("message.schema.registry.url", null) != null;
+                Schema schema = useRegistry ? null : SchemaLoader.fromFile(appProps);
                 for (int i = 0; i < numThreads; i++) {
                     KafkaConsumer<String, GenericRecord> c = useRegistry
                         ? KafkaClientFactory.createSchemaRegistryConsumer(appProps)
