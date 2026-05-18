@@ -31,6 +31,14 @@ public final class AppProperties {
     }
 
     /**
+     * Create an AppProperties instance from an already-assembled Properties object.
+     * Used by PipelineMain to build scoped views (global + prefix-stripped instance props).
+     */
+    public static AppProperties fromProperties(Properties props, String label) {
+        return new AppProperties(props, label);
+    }
+
+    /**
      * Load properties from the given file path.
      *
      * @param filePath absolute or relative path to the .properties file
