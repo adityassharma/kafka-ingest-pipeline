@@ -5,6 +5,8 @@ import io.github.adityassharma.kafka.common.AvroConverter;
 import io.github.adityassharma.kafka.common.KafkaClientFactory;
 import io.github.adityassharma.kafka.common.MessageFormat;
 import io.github.adityassharma.kafka.common.SchemaLoader;
+import io.github.adityassharma.kafka.management.ComponentStatus;
+import io.github.adityassharma.kafka.management.SourceStats;
 import io.github.adityassharma.kafka.spi.Source;
 import io.github.adityassharma.kafka.spi.SourceContext;
 import org.apache.avro.Schema;
@@ -40,6 +42,7 @@ public class SourceRunner {
     private final Source        source;
     private final AppProperties appProps;
     private final Properties    sourceConfig;
+    private final SourceStats   stats;
 
     private ExecutorService executor;
     private final List<Closeable> producersToClose = new ArrayList<>();
@@ -50,7 +53,10 @@ public class SourceRunner {
         this.source       = source;
         this.appProps     = appProps;
         this.sourceConfig = sourceConfig;
+        this.stats        = new SourceStats(name, source.type());
     }
+
+    public SourceStats getStats() { return stats; }
 
     /** Build the Kafka producer and start the source in a background thread. */
     public void start() {
@@ -73,9 +79,11 @@ public class SourceRunner {
         };
 
         executor.submit(() -> {
+            stats.status = ComponentStatus.RUNNING;
             try {
                 source.start(context);
             } catch (Exception e) {
+                stats.status = ComponentStatus.ERROR;
                 LOG.error("Source '{}' terminated with error: {}", name, e.getMessage(), e);
             }
         });
@@ -104,6 +112,7 @@ public class SourceRunner {
         try { source.close(); } catch (Exception e) {
             LOG.warn("Error closing source '{}': {}", name, e.getMessage());
         }
+        stats.status = ComponentStatus.STOPPED;
         LOG.info("SourceRunner '{}' shut down", name);
     }
 

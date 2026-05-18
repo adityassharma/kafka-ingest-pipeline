@@ -1,13 +1,13 @@
 package io.github.adityassharma.kafka.pipeline;
 
 import io.github.adityassharma.kafka.common.AppProperties;
+import io.github.adityassharma.kafka.management.ManagementServer;
 import io.github.adityassharma.kafka.spi.Sink;
 import io.github.adityassharma.kafka.spi.Source;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 import java.util.Properties;
 import java.util.ServiceLoader;
@@ -82,11 +82,26 @@ public class PipelineMain {
             return;
         }
 
+        // ---- Management server (optional) ----
+        ManagementServer mgmtServer = null;
+        String mgmtPortStr = pipelineProps.get("management.port", null);
+        if (mgmtPortStr != null) {
+            int mgmtPort = Integer.parseInt(mgmtPortStr.trim());
+            mgmtServer = new ManagementServer(
+                mgmtPort,
+                sourceRunners.stream().map(SourceRunner::getStats).toList(),
+                sinkRunners.stream().map(SinkRunner::getStats).toList()
+            );
+            mgmtServer.start();
+        }
+        final ManagementServer finalMgmt = mgmtServer;
+
         // ---- Shutdown hook ----
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             LOG.info("Shutdown signal received — stopping pipeline");
             sourceRunners.forEach(SourceRunner::shutdown);
             sinkRunners.forEach(SinkRunner::shutdown);
+            if (finalMgmt != null) finalMgmt.stop();
             LOG.info("Pipeline stopped");
         }, "pipeline-shutdown"));
 
@@ -94,8 +109,9 @@ public class PipelineMain {
         sinkRunners.forEach(SinkRunner::start);
         sourceRunners.forEach(SourceRunner::start);
 
-        LOG.info("Pipeline running: {} source(s), {} sink(s)",
-            sourceRunners.size(), sinkRunners.size());
+        LOG.info("Pipeline running: {} source(s), {} sink(s){}",
+            sourceRunners.size(), sinkRunners.size(),
+            mgmtServer != null ? " management=http://localhost:" + mgmtPortStr : "");
     }
 
     // -----------------------------------------------------------------------

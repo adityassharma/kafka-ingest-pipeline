@@ -5,6 +5,8 @@ import io.github.adityassharma.kafka.common.AvroConverter;
 import io.github.adityassharma.kafka.common.KafkaClientFactory;
 import io.github.adityassharma.kafka.common.MessageFormat;
 import io.github.adityassharma.kafka.common.SchemaLoader;
+import io.github.adityassharma.kafka.management.ComponentStatus;
+import io.github.adityassharma.kafka.management.SinkStats;
 import io.github.adityassharma.kafka.spi.Sink;
 import io.github.adityassharma.kafka.spi.SinkRecord;
 import org.apache.avro.Schema;
@@ -12,6 +14,7 @@ import org.apache.avro.generic.GenericRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.errors.WakeupException;
@@ -52,6 +55,7 @@ public class SinkRunner {
     private final Sink          sink;
     private final AppProperties appProps;
     private final Properties    sinkConfig;
+    private final SinkStats     stats;
 
     private ExecutorService             executor;
     private final AtomicBoolean         shutdown   = new AtomicBoolean(false);
@@ -64,7 +68,10 @@ public class SinkRunner {
         this.sink       = sink;
         this.appProps   = appProps;
         this.sinkConfig = sinkConfig;
+        this.stats      = new SinkStats(name, sink.type());
     }
+
+    public SinkStats getStats() { return stats; }
 
     /** Configure the sink, build consumers and optionally a DLQ producer, then start workers. */
     public void start() {
@@ -95,6 +102,7 @@ public class SinkRunner {
         MessageFormat format = MessageFormat.from(appProps.get("message.format", "json"));
         submitWorkers(format, topics, numThreads);
 
+        stats.status = ComponentStatus.RUNNING;
         LOG.info("SinkRunner '{}' started: type={} topics={} threads={} dlq={}",
             name, sink.type(), topics, numThreads, dlqTopic != null ? dlqTopic : "disabled");
     }
@@ -116,6 +124,7 @@ public class SinkRunner {
         try { sink.close(); } catch (Exception e) {
             LOG.warn("Error closing sink '{}': {}", name, e.getMessage());
         }
+        stats.status = ComponentStatus.STOPPED;
         if (dlqProducer != null) {
             dlqProducer.flush();
             dlqProducer.close();
@@ -161,6 +170,10 @@ public class SinkRunner {
             consumer.subscribe(topics);
             while (!shutdown.get()) {
                 ConsumerRecords<String, V> polled = consumer.poll(POLL_TIMEOUT);
+                for (TopicPartition tp : consumer.assignment()) {
+                    consumer.currentLag(tp).ifPresent(lag ->
+                        stats.updateLag(tp.topic() + ":" + tp.partition(), lag));
+                }
                 if (polled.isEmpty()) continue;
 
                 List<SinkRecord> batch = new ArrayList<>(polled.count());
@@ -201,6 +214,7 @@ public class SinkRunner {
         } catch (WakeupException e) {
             // Expected on shutdown — exit cleanly.
         } catch (Exception e) {
+            stats.status = ComponentStatus.ERROR;
             LOG.error("SinkRunner '{}' worker crashed: {}", name, e.getMessage(), e);
         } finally {
             try { consumer.close(); } catch (Exception e) {

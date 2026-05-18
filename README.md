@@ -71,6 +71,7 @@ same topic.
    - [Dead Letter Queue (DLQ)](#dead-letter-queue-dlq)
    - [Message format](#message-format)
    - [Kafka security modes](#kafka-security-modes)
+   - [Health & Metrics](#health--metrics)
 7. [Adding a new Source or Sink](#adding-a-new-source-or-sink)
 8. [Building](#building)
 9. [Running](#running)
@@ -160,6 +161,10 @@ config/pipeline.properties
   added to every document before indexing.
 - **Graceful shutdown** — JVM shutdown hook stops all sources and sinks cleanly, flushes
   producers, commits final offsets, and closes all resources.
+- **Built-in health & metrics endpoints** — optional lightweight HTTP server (JDK built-in,
+  zero new dependencies) exposing `GET /health` (JSON component status) and `GET /metrics`
+  (Prometheus plaintext consumer-lag gauges). Enabled by adding `management.port` to any
+  properties file; works in all three deployment modes independently.
 
 ---
 
@@ -207,6 +212,11 @@ kafka-ingest-pipeline/
 │   │   │   ├── PipelineMain.java     # entry point — discovers and starts all runners
 │   │   │   ├── SourceRunner.java     # manages one source + its KafkaProducer
 │   │   │   └── SinkRunner.java       # manages one sink + its consumer thread pool
+│   │   ├── management/
+│   │   │   ├── ComponentStatus.java  # enum: STARTING, RUNNING, STOPPED, ERROR
+│   │   │   ├── SourceStats.java      # name, type, volatile status
+│   │   │   ├── SinkStats.java        # name, type, volatile status, per-partition lag map
+│   │   │   └── ManagementServer.java # JDK HttpServer: /health and /metrics
 │   │   └── common/
 │   │       ├── AppProperties.java        # loads & validates .properties files
 │   │       ├── AvroConverter.java        # JSON <-> Avro GenericRecord
@@ -373,6 +383,7 @@ All configuration lives in a single **`config/pipeline.properties`** file.
 | `enable.idempotence` | — | `true` prevents duplicate messages on producer retry |
 | `compression.type` | `none` | `snappy`, `lz4`, `gzip`, `zstd`, `none` |
 | `security.protocol` | *(absent = PLAINTEXT)* | See [Kafka security modes](#kafka-security-modes) |
+| `management.port` | *(absent = disabled)* | TCP port for `/health` and `/metrics`; omit to disable |
 
 #### Source instance properties (`source.<name>.*`)
 
@@ -513,6 +524,52 @@ sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule require
   username="aditya" \
   password="aditya-secret";
 ```
+
+### Health & Metrics
+
+Add `management.port` to any properties file to enable the built-in HTTP server.
+No new dependencies — it uses the JDK's `com.sun.net.httpserver.HttpServer`.
+
+```properties
+management.port=8081   # pipeline.properties / source.properties
+management.port=8082   # sink.properties (different port when both run on the same host)
+```
+
+**`GET /health`** — JSON component status:
+
+```json
+{
+  "status": "UP",
+  "sources": [
+    {"name": "iss-position", "type": "iss-api",       "status": "RUNNING"},
+    {"name": "fluentbit",    "type": "http-listener",  "status": "RUNNING"}
+  ],
+  "sinks": [
+    {"name": "es-iss",  "type": "elasticsearch", "status": "RUNNING"},
+    {"name": "log-iss", "type": "logging",        "status": "RUNNING"}
+  ]
+}
+```
+
+Overall `status` is `UP` when all components are `RUNNING`, `ERROR` if any are in error,
+or `STARTING` otherwise.
+
+**`GET /metrics`** — Prometheus plaintext consumer-lag gauges:
+
+```
+# HELP kafka_consumer_lag Messages behind the latest offset
+# TYPE kafka_consumer_lag gauge
+kafka_consumer_lag{sink="es-iss",topic="open-notify-iss",partition="0"} 0
+kafka_consumer_lag{sink="es-iss",topic="open-notify-iss",partition="1"} 0
+```
+
+Lag is sampled from the in-memory metadata piggy-backed on Kafka fetch responses —
+no extra broker requests, zero polling overhead.  Gauges are populated after the first
+successful `poll()` in each worker thread; until then no entries appear.
+
+**Deployment note:** health and metrics work independently per JVM.  In the
+separate-server deployment (Options 2 and 3), each JVM exposes its own endpoint
+and only reports its own sources or sinks.
 
 ---
 
@@ -706,3 +763,12 @@ bin/kafka-consumer-groups.sh \
   ```bash
   bin/kafka-topics.sh --describe --bootstrap-server localhost:9092 --topic open-notify-iss
   ```
+
+**`/health` returns `STARTING` immediately after launch**
+- Sources and sinks transition to `RUNNING` as their threads start.
+  Allow a few seconds after the pipeline log line `Pipeline running: N source(s), N sink(s)`.
+
+**Port conflict on `management.port`**
+- Use different ports when two JVMs run on the same host
+  (e.g. `8081` in `source.properties` and `8082` in `sink.properties`).
+  Omit `management.port` entirely to disable the endpoint with zero overhead.
