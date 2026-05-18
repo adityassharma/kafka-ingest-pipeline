@@ -510,6 +510,12 @@ works correctly in the fat jar.
 
 ## Running
 
+`PipelineMain` accepts a single argument — the path to a properties file.
+The `sources` and `sinks` keys are both **optional**: if absent or empty the node simply
+skips that side.  This supports three deployment configurations:
+
+### Option 1 — single server, single JVM (combined)
+
 ```bash
 # Linux/macOS
 java -cp target/kafka-ingest-pipeline-1.0.0-fat.jar \
@@ -520,13 +526,38 @@ java -cp target/kafka-ingest-pipeline-1.0.0-fat.jar \
 java -cp target\kafka-ingest-pipeline-1.0.0-fat.jar io.github.adityassharma.kafka.pipeline.PipelineMain config\pipeline.properties
 ```
 
-`PipelineMain` starts sinks before sources to avoid dropping records published before
-consumers are ready. Send `SIGINT` (Ctrl-C) to trigger graceful shutdown — sources stop
-polling, in-flight messages are flushed, consumer workers finish their current batch,
-commit offsets, and all resources are closed cleanly.
+### Option 2 — separate servers (source node + sink node)
+
+Both nodes must point `bootstrap.servers` at the same Kafka cluster.
+
+**Source node** (producer / ingestion server):
+```bash
+java -cp target/kafka-ingest-pipeline-1.0.0-fat.jar \
+  io.github.adityassharma.kafka.pipeline.PipelineMain \
+  config/source.properties
+```
+
+**Sink node** (consumer / indexing server):
+```bash
+java -cp target/kafka-ingest-pipeline-1.0.0-fat.jar \
+  io.github.adityassharma.kafka.pipeline.PipelineMain \
+  config/sink.properties
+```
+
+### Option 3 — same server, separate JVMs
+
+Run the two commands above on the same machine to keep source and sink tuning
+(heap size, GC settings) independent.
+
+---
+
+`PipelineMain` always starts sinks before sources to avoid dropping records published
+before consumers are ready. Send `SIGINT` (Ctrl-C) to trigger graceful shutdown —
+sources stop polling, in-flight messages are flushed, consumer workers finish their
+current batch, commit offsets, and all resources are closed cleanly.
 
 **Disable the FluentBit HTTP listener** (if port 8080 is unavailable or not needed):
-remove `fluentbit` from the `sources=` list in `pipeline.properties`.
+remove `fluentbit` from the `sources=` list in the relevant properties file.
 
 ---
 

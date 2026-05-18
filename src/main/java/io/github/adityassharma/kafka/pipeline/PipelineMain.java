@@ -42,32 +42,44 @@ public class PipelineMain {
         List<SourceRunner> sourceRunners = new ArrayList<>();
         List<SinkRunner>   sinkRunners   = new ArrayList<>();
 
-        // ---- Sources ----
-        String[] sourceNames = pipelineProps.getRequired("sources").split(",");
-        for (String rawName : sourceNames) {
-            String sourceName = rawName.trim();
-            String prefix     = "source." + sourceName;
-            Properties mergedProps  = extractAndMerge(pipelineProps, prefix);
-            AppProperties sourceApp = AppProperties.fromProperties(mergedProps, prefix);
+        // ---- Sources (optional — absent or blank means this node runs no sources) ----
+        String sourcesVal = pipelineProps.get("sources", "").trim();
+        if (!sourcesVal.isEmpty()) {
+            for (String rawName : sourcesVal.split(",")) {
+                String sourceName = rawName.trim();
+                if (sourceName.isEmpty()) continue;
+                String prefix    = "source." + sourceName;
+                Properties mergedProps  = extractAndMerge(pipelineProps, prefix);
+                AppProperties sourceApp = AppProperties.fromProperties(mergedProps, prefix);
 
-            String type   = mergedProps.getProperty("type");
-            Source source = findSource(type);
+                String type   = mergedProps.getProperty("type");
+                Source source = findSource(type);
 
-            sourceRunners.add(new SourceRunner(sourceName, source, sourceApp, mergedProps));
+                sourceRunners.add(new SourceRunner(sourceName, source, sourceApp, mergedProps));
+            }
         }
 
-        // ---- Sinks ----
-        String[] sinkNames = pipelineProps.getRequired("sinks").split(",");
-        for (String rawName : sinkNames) {
-            String sinkName  = rawName.trim();
-            String prefix    = "sink." + sinkName;
-            Properties mergedProps = extractAndMerge(pipelineProps, prefix);
-            AppProperties sinkApp  = AppProperties.fromProperties(mergedProps, prefix);
+        // ---- Sinks (optional — absent or blank means this node runs no sinks) ----
+        String sinksVal = pipelineProps.get("sinks", "").trim();
+        if (!sinksVal.isEmpty()) {
+            for (String rawName : sinksVal.split(",")) {
+                String sinkName = rawName.trim();
+                if (sinkName.isEmpty()) continue;
+                String prefix    = "sink." + sinkName;
+                Properties mergedProps = extractAndMerge(pipelineProps, prefix);
+                AppProperties sinkApp  = AppProperties.fromProperties(mergedProps, prefix);
 
-            String type = mergedProps.getProperty("type");
-            Sink   sink = findSink(type);
+                String type = mergedProps.getProperty("type");
+                Sink   sink = findSink(type);
 
-            sinkRunners.add(new SinkRunner(sinkName, sink, sinkApp, mergedProps));
+                sinkRunners.add(new SinkRunner(sinkName, sink, sinkApp, mergedProps));
+            }
+        }
+
+        if (sourceRunners.isEmpty() && sinkRunners.isEmpty()) {
+            LOG.warn("No sources or sinks configured — nothing to run. " +
+                     "Set 'sources' and/or 'sinks' in the properties file.");
+            return;
         }
 
         // ---- Shutdown hook ----
