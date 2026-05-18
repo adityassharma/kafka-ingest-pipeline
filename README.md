@@ -1,8 +1,50 @@
 # kafka-ingest-pipeline
 
-A production-grade, pluggable Kafka ingestion pipeline inspired by Kafka Connect.
-Sources and sinks are discovered at runtime via Java's **Service Provider Interface (SPI)**,
-allowing new data sources and destinations to be added without touching core framework code.
+> **A note on production use**
+>
+> In a real production environment you would almost certainly reach for
+> [Kafka Connect](https://kafka.apache.org/documentation/#connect) instead of building
+> your own pipeline framework. Kafka Connect ships with hundreds of battle-tested
+> connectors (Elasticsearch, S3, JDBC, MongoDB, …), a distributed worker cluster for
+> horizontal scaling, a REST API for deploying and reconfiguring connectors at runtime
+> without restarts, and deep integration with Confluent Schema Registry and Single Message
+> Transforms (SMTs).
+>
+> **This project is primarily a learning exercise** — it is built on exactly the same
+> conceptual foundation as Kafka Connect (pluggable sources and sinks, SPI discovery,
+> topic-based routing, consumer-group fan-out, DLQ, at-least-once delivery with idempotent
+> writes) so working through it gives you a solid mental model of what Kafka Connect is
+> doing under the hood.
+>
+> That said, this codebase does have genuine utility where Kafka Connect would be
+> overkill or operationally inconvenient:
+> - **Zero cluster overhead** — a single fat JAR and a properties file is all you need.
+>   Kafka Connect in distributed mode requires running and monitoring a separate fleet of
+>   worker processes with their own REST API and coordinator.
+> - **Code-first configuration** — sources and sinks are plain Java classes; there are no
+>   JSON connector configs, no converter/transform chains, and no plugin-path management.
+>   Changing behaviour means changing code, not wrestling with a configuration DSL.
+> - **Transparent internals** — the producer, consumer, serialiser, offset commit, and
+>   DLQ logic are all directly visible and debuggable. Kafka Connect buries these behind
+>   several abstraction layers which makes tracing a bug significantly harder.
+> - **Embeddable** — the pipeline can be started inside a larger application with a single
+>   method call; no external process or sidecar required.
+> - **Custom business logic** — complex pre/post processing logic lives in a regular Java
+>   class rather than a chain of SMTs.
+> - **Avro without Schema Registry** — file-based Avro schema mode works with no
+>   additional infrastructure.
+>
+> In short: use this to learn, to prototype, or to run a lightweight pipeline where
+> standing up a Kafka Connect cluster is more trouble than it is worth. Graduate to Kafka
+> Connect when you need its connector ecosystem, distributed scaling, or live
+> reconfiguration.
+
+---
+
+A production-grade, pluggable Kafka ingestion pipeline modelled on the Kafka Connect
+architecture. Sources and sinks are discovered at runtime via Java's
+**Service Provider Interface (SPI)**, allowing new data sources and destinations to be
+added without touching core framework code.
 
 The default configuration polls the
 [Open-Notify ISS position API](http://api.open-notify.org/iss-now.json),
