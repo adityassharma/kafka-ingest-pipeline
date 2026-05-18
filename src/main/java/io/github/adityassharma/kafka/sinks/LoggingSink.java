@@ -1,7 +1,7 @@
 package io.github.adityassharma.kafka.sinks;
 
 import io.github.adityassharma.kafka.spi.Sink;
-import io.github.adityassharma.kafka.spi.SinkRecord;
+import io.github.adityassharma.kafka.spi.Record;
 import org.apache.logging.log4j.Level;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -38,8 +38,8 @@ public class LoggingSink implements Sink {
     }
 
     @Override
-    public List<SinkRecord> writeBatch(List<SinkRecord> records) {
-        for (SinkRecord r : records) {
+    public List<Record> writeBatch(List<Record> records) {
+        for (Record r : records) {
             LOG.log(logLevel, "[{}] topic={} partition={} offset={} key={} value={}",
                 r.timestamp(), r.topic(), r.partition(), r.offset(), r.key(), r.value());
         }

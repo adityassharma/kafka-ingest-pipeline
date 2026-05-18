@@ -9,8 +9,8 @@ import co.elastic.clients.transport.ElasticsearchTransport;
 import co.elastic.clients.transport.rest_client.RestClientTransport;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.adityassharma.kafka.spi.Record;
 import io.github.adityassharma.kafka.spi.Sink;
-import io.github.adityassharma.kafka.spi.SinkRecord;
 import org.apache.http.HttpHost;
 import org.apache.http.auth.AuthScope;
 import org.apache.http.auth.UsernamePasswordCredentials;
@@ -119,11 +119,11 @@ public class ElasticsearchSink implements Sink {
      * @return failed records (empty when all succeeded or when perItemTracking is off)
      */
     @Override
-    public List<SinkRecord> writeBatch(List<SinkRecord> records) throws Exception {
+    public List<Record> writeBatch(List<Record> records) throws Exception {
         if (records.isEmpty()) return Collections.emptyList();
 
         BulkRequest.Builder bulkBuilder = new BulkRequest.Builder();
-        for (SinkRecord r : records) {
+        for (Record r : records) {
             String docId   = r.topic() + "-" + r.partition() + "-" + r.offset();
             String enriched = injectRecordTimestamp(r.value(), r.timestamp());
             final String enrichedFinal = enriched;
@@ -148,7 +148,7 @@ public class ElasticsearchSink implements Sink {
         }
 
         // Per-item tracking: collect failures for DLQ routing.
-        List<SinkRecord> failures = new ArrayList<>();
+        List<Record> failures = new ArrayList<>();
         List<BulkResponseItem> items = response.items();
         for (int i = 0; i < items.size(); i++) {
             BulkResponseItem item = items.get(i);

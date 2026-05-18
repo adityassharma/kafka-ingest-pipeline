@@ -7,8 +7,8 @@ import io.github.adityassharma.kafka.common.MessageFormat;
 import io.github.adityassharma.kafka.common.SchemaLoader;
 import io.github.adityassharma.kafka.management.ComponentStatus;
 import io.github.adityassharma.kafka.management.SinkStats;
+import io.github.adityassharma.kafka.spi.Record;
 import io.github.adityassharma.kafka.spi.Sink;
-import io.github.adityassharma.kafka.spi.SinkRecord;
 import org.apache.avro.Schema;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
@@ -36,7 +36,7 @@ import java.util.function.Function;
 /**
  * Manages the lifecycle of a single {@link Sink} instance:
  * creates N KafkaConsumer worker threads, polls records, converts to
- * {@link SinkRecord}, calls {@link Sink#writeBatch}, routes failures to DLQ,
+ * {@link Record}, calls {@link Sink#writeBatch}, routes failures to DLQ,
  * and commits offsets.
  *
  * <p>Each worker thread owns its own KafkaConsumer (not thread-safe).
@@ -180,16 +180,16 @@ public class SinkRunner {
                 }
                 if (polled.isEmpty()) continue;
 
-                List<SinkRecord> batch = new ArrayList<>(polled.count());
+                List<Record> batch = new ArrayList<>(polled.count());
                 for (ConsumerRecord<String, V> r : polled) {
-                    batch.add(new SinkRecord(
+                    batch.add(new Record(
                         r.topic(), r.partition(), r.offset(),
                         r.key(), toJson.apply(r.value()),
                         Instant.ofEpochMilli(r.timestamp())
                     ));
                 }
 
-                List<SinkRecord> failures;
+                List<Record> failures;
                 try {
                     failures = sink.writeBatch(batch);
                 } catch (Exception e) {
@@ -200,7 +200,7 @@ public class SinkRunner {
                 }
 
                 if (!failures.isEmpty() && dlqProducer != null) {
-                    for (SinkRecord f : failures) {
+                    for (Record f : failures) {
                         dlqProducer.send(
                             new ProducerRecord<>(dlqTopic, f.key(), f.value()),
                             (meta, ex) -> {

@@ -47,5 +47,5 @@ public interface Sink extends Closeable {
      *         (the runner logs and skips in that case).
      * @throws Exception if the entire batch fails catastrophically
      */
-    List<SinkRecord> writeBatch(List<SinkRecord> records) throws Exception;
+    List<Record> writeBatch(List<Record> records) throws Exception;
 }
