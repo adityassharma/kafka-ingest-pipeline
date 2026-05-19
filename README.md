@@ -534,6 +534,36 @@ passed through unchanged. This means:
   `<topic>-<partition>-<offset>` is derived from the original metadata, so
   Elasticsearch re-indexing remains idempotent even after transformation.
 
+#### Conversion order — where transforms fit
+
+**Source side:**
+
+```
+source.emit(json)
+  → applyTransformChain()          [transforms run here — JSON string in, JSON string out]
+  → (JSON) ── message.format=json ──► producer.send()  → Kafka
+  → (JSON) ── message.format=avro ──► AvroConverter.fromJson()  → GenericRecord
+                                    → producer.send()  → Kafka (Avro binary)
+```
+
+**Sink side:**
+
+```
+Kafka
+  → consumer.poll()
+  → (String)       ── message.format=json ──► Record.value = raw JSON
+  → (GenericRecord) ─ message.format=avro ──► AvroConverter.toJson()  → Record.value = JSON
+  → applyTransforms()              [transforms run here — JSON string in, JSON string out]
+  → sink.writeBatch()
+```
+
+**Avro constraint on the source side:** transforms run *before* `AvroConverter.fromJson()`
+converts the JSON to a `GenericRecord`. That conversion is strict — any field in the JSON
+that is not declared in the Avro schema throws an exception. Transforms that add new fields
+(e.g. `inject-record-timestamp`) will fail on the source side unless the new field is
+declared in the `.avsc` file. On the **sink side there is no such constraint** — the Avro
+decode happens before transforms run, so the JSON is already free-form at that point.
+
 #### Built-in transforms
 
 | Type | Description |
