@@ -1,20 +1,20 @@
 # kafka-ingest-pipeline
 
-> **A note on production use**
->
-> In a real production environment you would almost certainly reach for
-> [Kafka Connect](https://kafka.apache.org/documentation/#connect) instead of building
-> your own pipeline framework. Kafka Connect ships with hundreds of battle-tested
-> connectors (Elasticsearch, S3, JDBC, MongoDB, …), a distributed worker cluster for
-> horizontal scaling, a REST API for deploying and reconfiguring connectors at runtime
-> without restarts, and deep integration with Confluent Schema Registry and Single Message
-> Transforms (SMTs).
->
-> **This project is primarily a learning exercise** — it is built on exactly the same
+
+> **This project is primarily a learning exercise** — it is built on the same
 > conceptual foundation as Kafka Connect (pluggable sources and sinks, SPI discovery,
 > topic-based routing, consumer-group fan-out, DLQ, at-least-once delivery with idempotent
-> writes) so working through it gives you a solid mental model of what Kafka Connect is
+> writes) so working through it provided a mental model of what Kafka Connect is
 > doing under the hood.
+> **A note on production use**
+>
+> A real production environment would reach for
+> [Kafka Connect](https://kafka.apache.org/documentation/#connect) instead of building
+> my own pipeline framework. Kafka Connect ships with battle-tested
+> connectors (Elasticsearch, S3, JDBC, MongoDB, …), a distributed worker cluster for
+> horizontal scaling, a REST API for deploying and reconfiguring connectors at runtime
+> without restarts, and integration with Confluent Schema Registry and Single Message
+> Transforms (SMTs).
 >
 > That said, this codebase does have genuine utility where Kafka Connect would be
 > overkill or operationally inconvenient:
@@ -34,10 +34,8 @@
 > - **Avro without Schema Registry** — file-based Avro schema mode works with no
 >   additional infrastructure.
 >
-> In short: use this to learn, to prototype, or to run a lightweight pipeline where
-> standing up a Kafka Connect cluster is more trouble than it is worth. Graduate to Kafka
-> Connect when you need its connector ecosystem, distributed scaling, or live
-> reconfiguration.
+> In short: This can be used to learn, to prototype, or to run a lightweight pipeline where
+> standing up a Kafka Connect cluster is more trouble than it is worth.
 
 ---
 
