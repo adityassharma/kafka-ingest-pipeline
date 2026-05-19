@@ -69,10 +69,11 @@ same topic.
    - [Routing: sources → topics → sinks](#routing-sources--topics--sinks)
    - [Fan-out: one source to multiple sinks](#fan-out-one-source-to-multiple-sinks)
    - [Dead Letter Queue (DLQ)](#dead-letter-queue-dlq)
+   - [Single Message Transforms (SMTs)](#single-message-transforms-smts)
    - [Message format](#message-format)
    - [Kafka security modes](#kafka-security-modes)
    - [Health & Metrics](#health--metrics)
-7. [Adding a new Source or Sink](#adding-a-new-source-or-sink)
+7. [Adding a new Source, Sink, or Transform](#adding-a-new-source-sink-or-transform)
 8. [Building](#building)
 9. [Running](#running)
 10. [Integration Test](#integration-test)
@@ -101,7 +102,7 @@ config/pipeline.properties
                           +-- ConsumerWorker threads, each with own KafkaConsumer
                           |        |
                           |        v
-                          |   Sink.writeBatch(List<SinkRecord>)  [one bulk request]
+                          |   Sink.writeBatch(List<Record>)  [one bulk request]
                           |        |
                           |        +-- ElasticsearchSink  (Bulk API, HTTPS, auth, TLS)
                           |        +-- LoggingSink         (Log4j2)
@@ -150,6 +151,12 @@ config/pipeline.properties
   per-item failure tracking is only enabled when a DLQ is configured.
 - **Dead Letter Queue (DLQ)** — configurable per sink; failed records are routed to a
   dedicated Kafka topic for inspection and replay.
+- **Single Message Transforms (SMTs)** — payload-only transform chain on both source and
+  sink side, configured per instance via `transforms=<type1>,<type2>,...`. Built-in:
+  `inject-record-timestamp` (reads the payload's Unix epoch `timestamp` and adds
+  `recordTimestamp` as ISO-8601). A `null` return from any transform silently drops the
+  record. Extend by implementing `Transform`, registering it in
+  `META-INF/services/io.github.adityassharma.kafka.spi.Transform`.
 - **Three message format modes** — JSON (default), Avro with file-based schema, Avro with
   Confluent Schema Registry.
 - **Four Kafka security modes** — PLAINTEXT, SSL, SASL\_PLAINTEXT, SASL\_SSL; switched
@@ -157,8 +164,6 @@ config/pipeline.properties
 - **Elasticsearch HTTPS + basic auth + JKS truststore** — all configured in
   `pipeline.properties`.
 - **Daily rolling Elasticsearch index** — date-math index name `<iss-positions-{now/d{yyyy-MM-dd}}>`.
-- **`recordTimestamp` enrichment** — Unix epoch `timestamp` is converted to ISO-8601 and
-  added to every document before indexing.
 - **Graceful shutdown** — JVM shutdown hook stops all sources and sinks cleanly, flushes
   producers, commits final offsets, and closes all resources.
 - **Built-in health & metrics endpoints** — optional lightweight HTTP server (JDK built-in,
@@ -199,7 +204,8 @@ kafka-ingest-pipeline/
 │   │   │   ├── Source.java           # source plugin interface
 │   │   │   ├── SourceContext.java    # framework handle passed to each source
 │   │   │   ├── Sink.java             # sink plugin interface
-│   │   │   └── SinkRecord.java       # immutable record delivered to sinks
+│   │   │   ├── Record.java           # immutable record (topic/partition/offset/key/value/timestamp)
+│   │   │   └── Transform.java        # SMT interface + loadChain() factory
 │   │   ├── sources/
 │   │   │   ├── IssApiSource.java     # polls Open-Notify ISS position API
 │   │   │   ├── HttpListenerSource.java  # accepts HTTP POST (FluentBit etc.)
@@ -208,6 +214,8 @@ kafka-ingest-pipeline/
 │   │   ├── sinks/
 │   │   │   ├── ElasticsearchSink.java  # Bulk API writer with optional DLQ tracking
 │   │   │   └── LoggingSink.java        # logs records via Log4j2
+│   │   ├── transforms/
+│   │   │   └── InjectRecordTimestamp.java  # SMT: adds recordTimestamp (ISO-8601) from payload epoch
 │   │   ├── pipeline/
 │   │   │   ├── PipelineMain.java     # entry point — discovers and starts all runners
 │   │   │   ├── SourceRunner.java     # manages one source + its KafkaProducer
@@ -227,8 +235,9 @@ kafka-ingest-pipeline/
 │   │       └── SchemaLoader.java         # loads .avsc schema from file
 │   └── resources/
 │       └── META-INF/services/
-│           ├── io.github.adityassharma.kafka.spi.Source  # registered Source impls
-│           └── io.github.adityassharma.kafka.spi.Sink    # registered Sink impls
+│           ├── io.github.adityassharma.kafka.spi.Source     # registered Source impls
+│           ├── io.github.adityassharma.kafka.spi.Sink        # registered Sink impls
+│           └── io.github.adityassharma.kafka.spi.Transform   # registered Transform impls
 ├── src/test/java/.../kafka/
 │   └── RoundTripIntegrationTest.java
 ├── pom.xml
@@ -391,6 +400,7 @@ All configuration lives in a single **`config/pipeline.properties`** file.
 |---|---|
 | `source.<name>.type` | Source type: `iss-api` or `http-listener` |
 | `source.<name>.topic` | Kafka topic to publish to |
+| `source.<name>.transforms` | Comma-separated SMT chain applied before producing (optional) |
 
 **`iss-api` additional properties:**
 
@@ -417,6 +427,7 @@ All configuration lives in a single **`config/pipeline.properties`** file.
 | `sink.<name>.threads` | `1` | Consumer worker threads (≤ partition count) |
 | `sink.<name>.auto.offset.reset` | `earliest` | `earliest` or `latest` |
 | `sink.<name>.dlq.topic` | *(absent = disabled)* | DLQ Kafka topic name; omit to disable DLQ |
+| `sink.<name>.transforms` | *(absent = none)* | Comma-separated SMT chain applied before `writeBatch()` |
 
 **`elasticsearch` additional properties:**
 
@@ -493,6 +504,47 @@ bin/kafka-topics.sh --create \
   --partitions 1 \
   --replication-factor 1
 ```
+
+### Single Message Transforms (SMTs)
+
+SMTs let you transform a record's JSON payload before it is produced to Kafka (source-side)
+or before it is written to the sink (sink-side). Transforms are applied in declaration order;
+a transform that returns `null` silently drops the record (it is not sent to Kafka / written
+to the sink, and is not routed to the DLQ).
+
+Configure a comma-separated chain on any source or sink instance:
+
+```properties
+# source-side — applied before producing to Kafka
+source.iss-position.transforms=inject-record-timestamp
+
+# sink-side — applied before writeBatch()
+sink.es-iss.transforms=inject-record-timestamp
+
+# chained (left-to-right; null from any step drops the record)
+sink.es-iss.transforms=inject-record-timestamp,mask-pii
+```
+
+**Important:** transforms operate on the JSON payload string only. Kafka metadata
+(topic, partition, offset, key, timestamp) is **not** visible to transforms and is
+passed through unchanged. This means:
+- Source-side transforms apply before the record is produced, so the Kafka-assigned
+  metadata is not yet available — only the raw payload.
+- Sink-side transforms apply after consumption; the document ID
+  `<topic>-<partition>-<offset>` is derived from the original metadata, so
+  Elasticsearch re-indexing remains idempotent even after transformation.
+
+#### Built-in transforms
+
+| Type | Description |
+|---|---|
+| `inject-record-timestamp` | Reads `timestamp` (Unix epoch seconds) from the payload and adds `recordTimestamp` as an ISO-8601 string. If `timestamp` is absent or not numeric, the payload is forwarded unchanged. Never drops a record. |
+
+#### Adding a custom transform
+
+See [Adding a new Transform](#adding-a-new-source-sink-or-transform) below.
+
+---
 
 ### Message format
 
@@ -573,7 +625,7 @@ and only reports its own sources or sinks.
 
 ---
 
-## Adding a new Source or Sink
+## Adding a new Source, Sink, or Transform
 
 ### New Source
 
@@ -586,11 +638,48 @@ and only reports its own sources or sinks.
 ### New Sink
 
 1. Create a class in `sinks/` that implements `io.github.adityassharma.kafka.spi.Sink`.
-2. Implement `type()`, `configure(Properties)`, `writeBatch(List<SinkRecord>)`, and `close()`.
-3. In `writeBatch`: send the batch to your destination; return a list of failed `SinkRecord`s (empty if all succeeded). Check `props.getProperty("dlq.topic") != null` in `configure()` to decide whether per-item failure tracking is needed.
+2. Implement `type()`, `configure(Properties)`, `writeBatch(List<Record>)`, and `close()`.
+3. In `writeBatch`: send the batch to your destination; return a list of failed `Record`s (empty if all succeeded). Check `props.getProperty("dlq.topic") != null` in `configure()` to decide whether per-item failure tracking is needed.
 4. Ensure the implementation is **thread-safe** — a single instance is shared across all worker threads.
 5. Add the fully-qualified class name to `src/main/resources/META-INF/services/io.github.adityassharma.kafka.spi.Sink`.
 6. Add a sink instance block to `pipeline.properties`.
+
+### New Transform
+
+1. Create a class in `transforms/` that implements `io.github.adityassharma.kafka.spi.Transform`.
+2. Implement three methods:
+   - `type()` — unique kebab-case string used in `transforms=...` config (e.g. `"mask-pii"`).
+   - `apply(String json)` — receive the JSON payload; return the transformed string, or `null` to drop the record.
+   - `close()` — release any resources (no-op for stateless transforms).
+3. Design for **thread safety** — a single instance may be called concurrently from multiple worker threads.
+4. Add the fully-qualified class name to
+   `src/main/resources/META-INF/services/io.github.adityassharma.kafka.spi.Transform`.
+5. Reference it by type name in `pipeline.properties`:
+   ```properties
+   source.my-source.transforms=mask-pii
+   sink.my-sink.transforms=inject-record-timestamp,mask-pii
+   ```
+
+**Example skeleton:**
+
+```java
+package io.github.adityassharma.kafka.transforms;
+
+import io.github.adityassharma.kafka.spi.Transform;
+
+public class MaskPii implements Transform {
+
+    @Override public String type() { return "mask-pii"; }
+
+    @Override
+    public String apply(String json) {
+        // manipulate JSON string; return null to drop the record
+        return json.replaceAll("\"email\":\"[^\"]+\"", "\"email\":\"***\"");
+    }
+
+    @Override public void close() { /* stateless */ }
+}
+```
 
 ---
 
@@ -725,6 +814,13 @@ sink.es-iss.elasticsearch.index=iss-positions
 - Confirm the class is listed in
   `src/main/resources/META-INF/services/io.github.adityassharma.kafka.spi.Source`.
 - Rebuild the fat jar — `ServicesResourceTransformer` must run to merge service files.
+
+**No Transform implementation found for type='...'**
+- Confirm the type name in `transforms=...` exactly matches the string returned by
+  `Transform.type()` in your implementation.
+- Confirm the class is listed in
+  `src/main/resources/META-INF/services/io.github.adityassharma.kafka.spi.Transform`.
+- Rebuild the fat jar so `ServicesResourceTransformer` merges the service file.
 
 **Sink receives no messages**
 - Confirm `sink.<name>.topics` matches the topic the source publishes to.

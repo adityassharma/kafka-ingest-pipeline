@@ -9,6 +9,7 @@ import io.github.adityassharma.kafka.management.ComponentStatus;
 import io.github.adityassharma.kafka.management.SinkStats;
 import io.github.adityassharma.kafka.spi.Record;
 import io.github.adityassharma.kafka.spi.Sink;
+import io.github.adityassharma.kafka.spi.Transform;
 import org.apache.avro.Schema;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
@@ -51,11 +52,12 @@ public class SinkRunner {
     private static final Logger LOG = LogManager.getLogger(SinkRunner.class);
     private static final Duration POLL_TIMEOUT = Duration.ofSeconds(1);
 
-    private final String        name;
-    private final Sink          sink;
-    private final AppProperties appProps;
-    private final Properties    sinkConfig;
-    private final SinkStats     stats;
+    private final String           name;
+    private final Sink             sink;
+    private final AppProperties    appProps;
+    private final Properties       sinkConfig;
+    private final SinkStats        stats;
+    private final List<Transform>  transforms;
 
     private ExecutorService             executor;
     private final AtomicBoolean         shutdown   = new AtomicBoolean(false);
@@ -69,6 +71,7 @@ public class SinkRunner {
         this.appProps   = appProps;
         this.sinkConfig = sinkConfig;
         this.stats      = new SinkStats(name, sink.type());
+        this.transforms = Transform.loadChain(sinkConfig.getProperty("transforms", ""));
     }
 
     public SinkStats getStats() { return stats; }
@@ -125,6 +128,11 @@ public class SinkRunner {
         try { sink.close(); } catch (Exception e) {
             LOG.warn("Error closing sink '{}': {}", name, e.getMessage());
         }
+        for (Transform t : transforms) {
+            try { t.close(); } catch (Exception e) {
+                LOG.warn("Error closing transform '{}' in sink '{}': {}", t.type(), name, e.getMessage());
+            }
+        }
         stats.status = ComponentStatus.STOPPED;
         if (dlqProducer != null) {
             dlqProducer.flush();
@@ -165,6 +173,28 @@ public class SinkRunner {
         }
     }
 
+    /**
+     * Run each record's value through the transform chain.
+     * A null return from any transform drops the record (it is not passed to the sink
+     * and is not routed to the DLQ — a drop is intentional, not a failure).
+     * Kafka metadata (topic, partition, offset, key, timestamp) is preserved unchanged.
+     */
+    private List<Record> applyTransforms(List<Record> batch) {
+        List<Record> out = new ArrayList<>(batch.size());
+        for (Record r : batch) {
+            String value = r.value();
+            for (Transform t : transforms) {
+                value = t.apply(value);
+                if (value == null) break;
+            }
+            if (value != null) {
+                out.add(new Record(r.topic(), r.partition(), r.offset(),
+                                   r.key(), value, r.timestamp()));
+            }
+        }
+        return out;
+    }
+
     private <V> void runWorker(
             KafkaConsumer<String, V> consumer,
             Function<V, String> toJson,
@@ -189,14 +219,20 @@ public class SinkRunner {
                     ));
                 }
 
+                List<Record> toWrite = transforms.isEmpty() ? batch : applyTransforms(batch);
+                if (toWrite.isEmpty()) {
+                    consumer.commitSync();
+                    continue;
+                }
+
                 List<Record> failures;
                 try {
-                    failures = sink.writeBatch(batch);
+                    failures = sink.writeBatch(toWrite);
                 } catch (Exception e) {
                     LOG.error("SinkRunner '{}': writeBatch threw — routing {} records: {}",
-                        name, batch.size(), e.getMessage());
+                        name, toWrite.size(), e.getMessage());
                     // Whole batch failed — route all to DLQ if configured, else skip
-                    failures = (dlqProducer != null) ? batch : List.of();
+                    failures = (dlqProducer != null) ? toWrite : List.of();
                 }
 
                 if (!failures.isEmpty() && dlqProducer != null) {

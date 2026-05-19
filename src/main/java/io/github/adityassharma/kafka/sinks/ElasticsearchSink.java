@@ -7,8 +7,6 @@ import co.elastic.clients.elasticsearch.core.bulk.BulkResponseItem;
 import co.elastic.clients.json.jackson.JacksonJsonpMapper;
 import co.elastic.clients.transport.ElasticsearchTransport;
 import co.elastic.clients.transport.rest_client.RestClientTransport;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.adityassharma.kafka.spi.Record;
 import io.github.adityassharma.kafka.spi.Sink;
 import org.apache.http.HttpHost;
@@ -26,7 +24,6 @@ import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.StringReader;
 import java.security.KeyStore;
-import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -57,7 +54,6 @@ import java.util.Properties;
 public class ElasticsearchSink implements Sink {
 
     private static final Logger LOG = LogManager.getLogger(ElasticsearchSink.class);
-    private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private ElasticsearchClient esClient;
     private RestClient restClient;
@@ -124,14 +120,13 @@ public class ElasticsearchSink implements Sink {
 
         BulkRequest.Builder bulkBuilder = new BulkRequest.Builder();
         for (Record r : records) {
-            String docId   = r.topic() + "-" + r.partition() + "-" + r.offset();
-            String enriched = injectRecordTimestamp(r.value(), r.timestamp());
-            final String enrichedFinal = enriched;
+            String docId = r.topic() + "-" + r.partition() + "-" + r.offset();
+            String value = r.value();
             bulkBuilder.operations(op -> op
                 .index(idx -> idx
                     .index(indexName)
                     .id(docId)
-                    .withJson(new StringReader(enrichedFinal))
+                    .withJson(new StringReader(value))
                 )
             );
         }
@@ -169,22 +164,6 @@ public class ElasticsearchSink implements Sink {
     public void close() throws IOException {
         LOG.info("Closing ElasticsearchSink for index={}", indexName);
         if (restClient != null) restClient.close();
-    }
-
-    private static String injectRecordTimestamp(String jsonDoc, Instant timestamp) {
-        try {
-            ObjectNode node = (ObjectNode) MAPPER.readTree(jsonDoc);
-            if (node.has("timestamp") && node.get("timestamp").isNumber()) {
-                long epochSeconds = node.get("timestamp").asLong();
-                node.put("recordTimestamp", Instant.ofEpochSecond(epochSeconds).toString());
-            } else if (timestamp != null) {
-                node.put("recordTimestamp", timestamp.toString());
-            }
-            return MAPPER.writeValueAsString(node);
-        } catch (Exception e) {
-            LOG.warn("Failed to inject recordTimestamp, forwarding original: {}", e.getMessage());
-            return jsonDoc;
-        }
     }
 
     private static SSLContext buildSslContext(String truststorePath, String truststorePassword) {
