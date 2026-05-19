@@ -49,7 +49,11 @@ public class IssApiSource implements Source {
         while (!stopped.get()) {
             String json = dataFetcher.fetch(url);
             if (json != null) {
+                LOG.info("IssApiSource fetched record, emitting to topic '{}'", topic);
+                LOG.debug("IssApiSource payload: {}", json);
                 context.emit(topic, json);
+            } else {
+                LOG.warn("IssApiSource: fetch returned null for url={}", url);
             }
             try {
                 Thread.sleep(intervalMs);

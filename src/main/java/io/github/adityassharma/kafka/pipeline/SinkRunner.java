@@ -83,7 +83,7 @@ public class SinkRunner {
         dlqTopic = sinkConfig.getProperty("dlq.topic");
         if (dlqTopic != null) {
             dlqProducer = KafkaClientFactory.createProducer(appProps);
-            LOG.info("SinkRunner '{}': DLQ enabled → topic={}", name, dlqTopic);
+            LOG.info("SinkRunner '{}': DLQ enabled -> topic={}", name, dlqTopic);
         }
 
         List<String> topics = Arrays.stream(
@@ -229,8 +229,8 @@ public class SinkRunner {
                 try {
                     failures = sink.writeBatch(toWrite);
                 } catch (Exception e) {
-                    LOG.error("SinkRunner '{}': writeBatch threw — routing {} records: {}",
-                        name, toWrite.size(), e.getMessage());
+                    LOG.error("SinkRunner '{}': writeBatch threw - routing {} records: {}",
+                        name, toWrite.size(), e.getMessage(), e);
                     // Whole batch failed — route all to DLQ if configured, else skip
                     failures = (dlqProducer != null) ? toWrite : List.of();
                 }
@@ -240,12 +240,12 @@ public class SinkRunner {
                         dlqProducer.send(
                             new ProducerRecord<>(dlqTopic, f.key(), f.value()),
                             (meta, ex) -> {
-                                if (ex != null) LOG.error("Failed to send to DLQ {}: {}", dlqTopic, ex.getMessage());
+                                if (ex != null) LOG.error("Failed to send to DLQ {}: {}", dlqTopic, ex.getMessage(), ex);
                             }
                         );
                     }
                 } else if (!failures.isEmpty()) {
-                    LOG.warn("SinkRunner '{}': {} records failed but no DLQ configured — skipping",
+                    LOG.warn("SinkRunner '{}': {} records failed but no DLQ configured - skipping",
                         name, failures.size());
                 }
 

@@ -6,27 +6,28 @@ import co.elastic.clients.elasticsearch.core.BulkResponse;
 import co.elastic.clients.elasticsearch.core.bulk.BulkResponseItem;
 import co.elastic.clients.json.jackson.JacksonJsonpMapper;
 import co.elastic.clients.transport.ElasticsearchTransport;
-import co.elastic.clients.transport.rest_client.RestClientTransport;
+import co.elastic.clients.transport.rest5_client.Rest5ClientTransport;
+import co.elastic.clients.transport.rest5_client.low_level.Rest5Client;
+import co.elastic.clients.transport.rest5_client.low_level.Rest5ClientBuilder;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.adityassharma.kafka.spi.Record;
 import io.github.adityassharma.kafka.spi.Sink;
-import org.apache.http.HttpHost;
-import org.apache.http.auth.AuthScope;
-import org.apache.http.auth.UsernamePasswordCredentials;
-import org.apache.http.impl.client.BasicCredentialsProvider;
+import org.apache.hc.core5.http.HttpHost;
+import org.apache.hc.core5.http.message.BasicHeader;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.elasticsearch.client.RestClient;
-import org.elasticsearch.client.RestClientBuilder;
 
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManagerFactory;
 import java.io.FileInputStream;
 import java.io.IOException;
-import java.io.StringReader;
+import java.nio.charset.StandardCharsets;
 import java.security.KeyStore;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Properties;
 
 /**
@@ -37,6 +38,9 @@ import java.util.Properties;
  * avoiding the cost of iterating the bulk response on the happy path.
  *
  * <p>Thread-safe: one instance is shared across all SinkRunner worker threads.
+ *
+ * <p>Uses the Elasticsearch Java client 9.x ({@code Rest5ClientTransport} /
+ * HttpClient 5.x) — compatible with Elasticsearch server 9.x.
  *
  * <p>Config keys (after prefix stripping):
  * <ul>
@@ -53,12 +57,13 @@ import java.util.Properties;
  */
 public class ElasticsearchSink implements Sink {
 
-    private static final Logger LOG = LogManager.getLogger(ElasticsearchSink.class);
+    private static final Logger LOG    = LogManager.getLogger(ElasticsearchSink.class);
+    private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private ElasticsearchClient esClient;
-    private RestClient restClient;
-    private String indexName;
-    private boolean perItemTracking;
+    private Rest5Client         rest5Client;
+    private String              indexName;
+    private boolean             perItemTracking;
 
     @Override
     public String type() {
@@ -81,27 +86,32 @@ public class ElasticsearchSink implements Sink {
         LOG.info("ElasticsearchSink connecting to {}://{}:{} index={} perItemTracking={}",
             scheme, host, port, indexName, perItemTracking);
 
-        RestClientBuilder builder = RestClient.builder(new HttpHost(host, port, scheme));
+        // ES 9.x: HttpHost constructor order is (scheme, host, port) — scheme is first.
+        Rest5ClientBuilder builder = Rest5Client.builder(new HttpHost(scheme, host, port));
 
         String truststorePath     = props.getProperty("elasticsearch.ssl.truststore.location");
         String truststorePassword = props.getProperty("elasticsearch.ssl.truststore.password");
         String username           = props.getProperty("elasticsearch.username");
         String password           = props.getProperty("elasticsearch.password");
 
-        builder.setHttpClientConfigCallback(httpClientBuilder -> {
-            if (truststorePath != null) {
-                httpClientBuilder.setSSLContext(buildSslContext(truststorePath, truststorePassword));
-            }
-            if (username != null) {
-                BasicCredentialsProvider cp = new BasicCredentialsProvider();
-                cp.setCredentials(AuthScope.ANY, new UsernamePasswordCredentials(username, password));
-                httpClientBuilder.setDefaultCredentialsProvider(cp);
-            }
-            return httpClientBuilder;
-        });
+        if (truststorePath != null) {
+            // SSL context is set directly on the builder (no callback needed in 9.x).
+            builder.setSSLContext(buildSslContext(truststorePath, truststorePassword));
+        }
 
-        restClient = builder.build();
-        ElasticsearchTransport transport = new RestClientTransport(restClient, new JacksonJsonpMapper());
+        if (username != null) {
+            // Basic auth via a default Authorization header (no CredentialsProvider in 9.x).
+            String credentials = username + ":" + (password != null ? password : "");
+            String encoded = Base64.getEncoder()
+                .encodeToString(credentials.getBytes(StandardCharsets.UTF_8));
+            builder.setDefaultHeaders(new BasicHeader[]{
+                new BasicHeader("Authorization", "Basic " + encoded)
+            });
+        }
+
+        rest5Client = builder.build();
+        ElasticsearchTransport transport =
+            new Rest5ClientTransport(rest5Client, new JacksonJsonpMapper());
         esClient = new ElasticsearchClient(transport);
     }
 
@@ -119,25 +129,42 @@ public class ElasticsearchSink implements Sink {
         if (records.isEmpty()) return Collections.emptyList();
 
         BulkRequest.Builder bulkBuilder = new BulkRequest.Builder();
+        int validOps = 0;
         for (Record r : records) {
             String docId = r.topic() + "-" + r.partition() + "-" + r.offset();
-            String value = r.value();
+            // Parse JSON to a Map so the ES client can re-serialise it as the document body.
+            // In ES 9.x, IndexOperation.Builder.withJson() tries to deserialise a full
+            // IndexOperation (metadata fields), NOT set the raw document — so we must not
+            // use withJson() here; .document(Map) is the correct approach.
+            @SuppressWarnings("unchecked")
+            final Map<String, Object> doc;
+            try {
+                doc = MAPPER.readValue(r.value(), Map.class);
+            } catch (IOException e) {
+                LOG.warn("Skipping record {}: invalid JSON - {}", docId, e.getMessage());
+                continue;
+            }
             bulkBuilder.operations(op -> op
                 .index(idx -> idx
                     .index(indexName)
                     .id(docId)
-                    .withJson(new StringReader(value))
+                    .document(doc)
                 )
             );
+            validOps++;
+        }
+        if (validOps == 0) {
+            LOG.warn("writeBatch: all {} records skipped (invalid JSON) - nothing sent to ES", records.size());
+            return Collections.emptyList();
         }
 
         BulkResponse response = esClient.bulk(bulkBuilder.build());
 
         if (!perItemTracking) {
             if (response.errors()) {
-                LOG.error("Bulk request had errors (perItemTracking disabled) — skipping failed items");
+                LOG.error("Bulk request had errors (perItemTracking disabled) - skipping failed items");
             } else {
-                LOG.debug("Bulk indexed {} documents to {}", records.size(), indexName);
+                LOG.info("Bulk indexed {} documents to '{}'", records.size(), indexName);
             }
             return Collections.emptyList();
         }
@@ -155,7 +182,7 @@ public class ElasticsearchSink implements Sink {
         if (!failures.isEmpty()) {
             LOG.error("Bulk request: {}/{} items failed", failures.size(), records.size());
         } else {
-            LOG.debug("Bulk indexed {} documents to {}", records.size(), indexName);
+            LOG.info("Bulk indexed {} documents to '{}'", records.size(), indexName);
         }
         return failures;
     }
@@ -163,7 +190,7 @@ public class ElasticsearchSink implements Sink {
     @Override
     public void close() throws IOException {
         LOG.info("Closing ElasticsearchSink for index={}", indexName);
-        if (restClient != null) restClient.close();
+        if (rest5Client != null) rest5Client.close();
     }
 
     private static SSLContext buildSslContext(String truststorePath, String truststorePassword) {

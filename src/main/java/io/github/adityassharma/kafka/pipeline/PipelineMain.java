@@ -77,7 +77,7 @@ public class PipelineMain {
         }
 
         if (sourceRunners.isEmpty() && sinkRunners.isEmpty()) {
-            LOG.warn("No sources or sinks configured — nothing to run. " +
+            LOG.warn("No sources or sinks configured - nothing to run. " +
                      "Set 'sources' and/or 'sinks' in the properties file.");
             return;
         }
@@ -98,7 +98,7 @@ public class PipelineMain {
 
         // ---- Shutdown hook ----
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            LOG.info("Shutdown signal received — stopping pipeline");
+            LOG.info("Shutdown signal received - stopping pipeline");
             sourceRunners.forEach(SourceRunner::shutdown);
             sinkRunners.forEach(SinkRunner::shutdown);
             if (finalMgmt != null) finalMgmt.stop();

@@ -151,7 +151,12 @@ public class SourceRunner {
                 return (topic, json) -> producer.send(
                     new ProducerRecord<>(topic, json),
                     (meta, ex) -> {
-                        if (ex != null) LOG.error("Source '{}' produce failed: {}", name, ex.getMessage());
+                        if (ex != null) {
+                            LOG.error("Source '{}' produce failed: {}", name, ex.getMessage());
+                        } else {
+                            LOG.info("Source '{}' produced record -> topic={} partition={} offset={}",
+                                name, meta.topic(), meta.partition(), meta.offset());
+                        }
                     }
                 );
             }
@@ -170,7 +175,12 @@ public class SourceRunner {
                         GenericRecord record = AvroConverter.fromJson(json, schema);
                         producer.send(new ProducerRecord<>(topic, record),
                             (meta, ex) -> {
-                                if (ex != null) LOG.error("Source '{}' produce failed: {}", name, ex.getMessage());
+                                if (ex != null) {
+                                    LOG.error("Source '{}' produce failed: {}", name, ex.getMessage());
+                                } else {
+                                    LOG.info("Source '{}' produced record -> topic={} partition={} offset={}",
+                                        name, meta.topic(), meta.partition(), meta.offset());
+                                }
                             });
                     };
                 } else {
@@ -181,7 +191,12 @@ public class SourceRunner {
                         GenericRecord record = AvroConverter.fromJson(json, schema);
                         producer.send(new ProducerRecord<>(topic, record),
                             (meta, ex) -> {
-                                if (ex != null) LOG.error("Source '{}' produce failed: {}", name, ex.getMessage());
+                                if (ex != null) {
+                                    LOG.error("Source '{}' produce failed: {}", name, ex.getMessage());
+                                } else {
+                                    LOG.info("Source '{}' produced record -> topic={} partition={} offset={}",
+                                        name, meta.topic(), meta.partition(), meta.offset());
+                                }
                             });
                     };
                 }
