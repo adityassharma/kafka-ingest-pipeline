@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # =============================================================================
 # run-producer.sh
-# Starts the multi-threaded Kafka producer.
+# Starts the pipeline in source-only mode (producer / ingestion node).
 #
 # Usage:
-#   ./scripts/run-producer.sh [path-to-producer.properties]
+#   ./scripts/run-producer.sh [path-to-properties]
 #
-# Defaults to config/producer.properties when no argument is given.
+# Defaults to config/source.properties when no argument is given.
+# Pass config/pipeline.properties to run sources AND sinks in the same JVM.
+#
 # See run-consumer.sh for GC rationale and flags documentation.
 # =============================================================================
 
@@ -15,7 +17,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_HOME="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-PROPS_FILE="${1:-${APP_HOME}/config/producer.properties}"
+PROPS_FILE="${1:-${APP_HOME}/config/source.properties}"
 
 if [[ ! -f "${PROPS_FILE}" ]]; then
     echo "ERROR: Properties file not found: ${PROPS_FILE}" >&2
@@ -64,12 +66,13 @@ JVM_ARGS=(
     "-Dapp.log.dir=${APP_LOG_DIR}"
     "-Dlog4j2.configurationFile=classpath:log4j2.xml"
     "-Djava.awt.headless=true"
+    "--enable-native-access=ALL-UNNAMED"   # suppress Snappy native-access warning
 )
 
-MAIN_CLASS="io.github.adityassharma.kafka.producer.ProducerMain"
+MAIN_CLASS="io.github.adityassharma.kafka.pipeline.PipelineMain"
 
 echo "============================================================"
-echo "  Kafka Producer"
+echo "  Kafka Pipeline (source node)"
 echo "  Properties : ${PROPS_FILE}"
 echo "  Heap       : Xms=${XMS} Xmx=${XMX}"
 echo "  GC         : ${GC_OPTS}"

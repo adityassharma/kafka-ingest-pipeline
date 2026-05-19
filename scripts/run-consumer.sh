@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # =============================================================================
 # run-consumer.sh
-# Starts the multi-threaded Kafka consumer.
+# Starts the pipeline in sink-only mode (consumer / indexing node).
 #
 # Usage:
-#   ./scripts/run-consumer.sh [path-to-consumer.properties]
+#   ./scripts/run-consumer.sh [path-to-properties]
 #
-# Defaults to config/consumer.properties when no argument is given.
+# Defaults to config/sink.properties when no argument is given.
+# Pass config/pipeline.properties to run sources AND sinks in the same JVM.
 #
 # Properties read from the properties file:
 #   jvm.heap.xms        - initial heap size (e.g. 512m)
@@ -45,7 +46,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_HOME="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # ---- Properties file ---------------------------------------------------------
-PROPS_FILE="${1:-${APP_HOME}/config/consumer.properties}"
+PROPS_FILE="${1:-${APP_HOME}/config/sink.properties}"
 
 if [[ ! -f "${PROPS_FILE}" ]]; then
     echo "ERROR: Properties file not found: ${PROPS_FILE}" >&2
@@ -91,7 +92,6 @@ fi
 # -Xlog:gc* — unified JVM logging, covers GC, heap, safepoints
 # filesize=10m — roll each GC log at 10 MB
 # filecount=6  — keep 6 rotated files (older auto-deleted)
-# The :gz suffix gzips rolled files automatically (JDK 11+)
 GC_LOG_FILE="${GC_LOG_DIR}/gc-consumer-%t.log"
 GC_LOG_FLAGS="-Xlog:gc*,safepoint:file=${GC_LOG_FILE}:time,uptime,pid,level,tags:filesize=10m,filecount=6"
 
@@ -104,13 +104,14 @@ JVM_ARGS=(
     "-Dapp.log.dir=${APP_LOG_DIR}"
     "-Dlog4j2.configurationFile=classpath:log4j2.xml"
     "-Djava.awt.headless=true"
+    "--enable-native-access=ALL-UNNAMED"   # suppress Snappy native-access warning
 )
 
 # ---- Main class --------------------------------------------------------------
-MAIN_CLASS="cio.github.adityassharma.kafka.consumer.ConsumerMain"
+MAIN_CLASS="io.github.adityassharma.kafka.pipeline.PipelineMain"
 
 echo "============================================================"
-echo "  Kafka Consumer"
+echo "  Kafka Pipeline (sink node)"
 echo "  Properties : ${PROPS_FILE}"
 echo "  Heap       : Xms=${XMS} Xmx=${XMX}"
 echo "  GC         : ${GC_OPTS}"
