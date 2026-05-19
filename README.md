@@ -180,7 +180,7 @@ config/pipeline.properties
 | Java (JDK) | 25 | `JAVA_HOME` must be set |
 | Maven | 3.9 | Used to build and run tests |
 | Apache Kafka | 4.2.0 | Broker + CLI scripts; KRaft mode (no ZooKeeper) |
-| Elasticsearch | 8.x / 9.x | HTTPS recommended; HTTP also supported |
+| Elasticsearch | 9.x | HTTPS recommended; HTTP also supported |
 | Kibana | matching ES version | Optional — for visualization |
 | Confluent Schema Registry | 7.x | Optional — Avro + Schema Registry mode only |
 
@@ -818,6 +818,12 @@ sink.es-iss.elasticsearch.index=iss-positions
 
 ### Creating a Kibana data view
 
+> **Prerequisite:** `recordTimestamp` is added to each document by the
+> `inject-record-timestamp` SMT.  Confirm `sink.es-iss.transforms=inject-record-timestamp`
+> is **uncommented** in `config/sink.properties` (it is enabled by default).  If the line
+> is commented out, documents will not contain the field and Kibana's time filter will
+> never match any records.
+
 1. Open Kibana → **Management → Stack Management → Data Views**
 2. Click **Create data view**
 3. Set the index pattern to `iss-positions-*`
@@ -898,3 +904,14 @@ bin/kafka-consumer-groups.sh \
 - Use different ports when two JVMs run on the same host
   (e.g. `8081` in `source.properties` and `8082` in `sink.properties`).
   Omit `management.port` entirely to disable the endpoint with zero overhead.
+
+**Kibana Discover shows no data despite records being indexed**
+- Check that `sink.es-iss.transforms=inject-record-timestamp` is uncommented in
+  `config/sink.properties`. Without it, documents lack the `recordTimestamp` field and
+  Kibana's time filter (which uses that field) matches nothing regardless of the range set.
+- Expand the Kibana time range to cover the period when the consumer was running — the
+  default "Last 15 minutes" window often excludes earlier test runs.
+- Verify records are actually reaching Elasticsearch by checking the consumer log for
+  `Bulk indexed N documents to 'iss-positions-...'` at INFO level.  If you see only
+  `LoggingSink` output and no ES sink output, the bulk requests are failing silently;
+  check for `ERROR` or `WARN` lines from `ElasticsearchSink`.
