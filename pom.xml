@@ -20,7 +20,7 @@
 
         <!-- Dependency versions -->
         <kafka.version>3.9.0</kafka.version>
-        <elasticsearch.version>8.13.0</elasticsearch.version>
+        <elasticsearch.version>9.0.0</elasticsearch.version>
         <log4j.version>2.24.3</log4j.version>
         <jackson.version>2.18.3</jackson.version>
         <junit.version>5.10.2</junit.version>
@@ -52,6 +52,19 @@
             <artifactId>jakarta.json-api</artifactId>
             <version>2.1.3</version>
         </dependency>
+        <!--
+            Jakarta JSON-P runtime implementation required by the Elasticsearch Java client.
+            The client uses JsonProvider.provider() internally when parsing responses
+            (e.g. BulkResponse items) even when JacksonJsonpMapper is the configured mapper.
+            Without this, response deserialization throws "cannot be read from JSON".
+            Must match the jakarta.json-api major version: api 2.1.x → parsson 1.1.x.
+        -->
+        <dependency>
+            <groupId>org.eclipse.parsson</groupId>
+            <artifactId>parsson</artifactId>
+            <version>1.1.6</version>
+            <scope>runtime</scope>
+        </dependency>
 
         <!-- ===== HTTP client (for producer data source) ===== -->
         <dependency>
@@ -75,6 +88,12 @@
         <dependency>
             <groupId>org.apache.logging.log4j</groupId>
             <artifactId>log4j-slf4j2-impl</artifactId>
+            <version>${log4j.version}</version>
+        </dependency>
+        <!-- Bridge commons-logging (used by ES 9.x Rest5Client) → Log4j2 -->
+        <dependency>
+            <groupId>org.apache.logging.log4j</groupId>
+            <artifactId>log4j-jcl</artifactId>
             <version>${log4j.version}</version>
         </dependency>
 
@@ -116,7 +135,7 @@
     <build>
         <plugins>
 
-            <!-- Compiler plugin - enforce Java 17 -->
+            <!-- Compiler plugin -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>

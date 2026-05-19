@@ -31,6 +31,14 @@ public final class AppProperties {
     }
 
     /**
+     * Create an AppProperties instance from an already-assembled Properties object.
+     * Used by PipelineMain to build scoped views (global + prefix-stripped instance props).
+     */
+    public static AppProperties fromProperties(Properties props, String label) {
+        return new AppProperties(props, label);
+    }
+
+    /**
      * Load properties from the given file path.
      *
      * @param filePath absolute or relative path to the .properties file
@@ -71,9 +79,12 @@ public final class AppProperties {
 
     /**
      * Get an optional string property with a default.
+     * Returns {@code defaultValue} (which may be null) when the key is absent or blank.
      */
     public String get(String key, String defaultValue) {
-        return props.getProperty(key, defaultValue).trim();
+        String val = props.getProperty(key);
+        if (val == null || val.isBlank()) return defaultValue;
+        return val.trim();
     }
 
     /**

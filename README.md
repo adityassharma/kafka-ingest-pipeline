@@ -1,9 +1,54 @@
 # kafka-ingest-pipeline
 
-A multi-threaded Kafka ingestion pipeline that polls the
+
+> **This project is primarily a learning exercise** — it is built on the same
+> conceptual foundation as Kafka Connect (pluggable sources and sinks, SPI discovery,
+> topic-based routing, consumer-group fan-out, DLQ, at-least-once delivery with idempotent
+> writes) so working through it provided a mental model of what Kafka Connect is
+> doing under the hood.
+> **A note on production use**
+>
+> A real production environment would reach for
+> [Kafka Connect](https://kafka.apache.org/documentation/#connect) instead of building
+> my own pipeline framework. Kafka Connect ships with battle-tested
+> connectors (Elasticsearch, S3, JDBC, MongoDB, …), a distributed worker cluster for
+> horizontal scaling, a REST API for deploying and reconfiguring connectors at runtime
+> without restarts, and integration with Confluent Schema Registry and Single Message
+> Transforms (SMTs).
+>
+> That said, this codebase does have genuine utility where Kafka Connect would be
+> overkill or operationally inconvenient:
+> - **Zero cluster overhead** — a single fat JAR and a properties file is all you need.
+>   Kafka Connect in distributed mode requires running and monitoring a separate fleet of
+>   worker processes with their own REST API and coordinator.
+> - **Code-first configuration** — sources and sinks are plain Java classes; there are no
+>   JSON connector configs, no converter/transform chains, and no plugin-path management.
+>   Changing behaviour means changing code, not wrestling with a configuration DSL.
+> - **Transparent internals** — the producer, consumer, serialiser, offset commit, and
+>   DLQ logic are all directly visible and debuggable. Kafka Connect buries these behind
+>   several abstraction layers which makes tracing a bug significantly harder.
+> - **Embeddable** — the pipeline can be started inside a larger application with a single
+>   method call; no external process or sidecar required.
+> - **Custom business logic** — complex pre/post processing logic lives in a regular Java
+>   class rather than a chain of SMTs.
+> - **Avro without Schema Registry** — file-based Avro schema mode works with no
+>   additional infrastructure.
+>
+> In short: This can be used to learn, to prototype, or to run a lightweight pipeline where
+> standing up a Kafka Connect cluster is more trouble than it is worth.
+
+---
+
+A production-grade, pluggable Kafka ingestion pipeline modelled on the Kafka Connect
+architecture. Sources and sinks are discovered at runtime via Java's
+**Service Provider Interface (SPI)**, allowing new data sources and destinations to be
+added without touching core framework code.
+
+The default configuration polls the
 [Open-Notify ISS position API](http://api.open-notify.org/iss-now.json),
-publishes records to Kafka, consumes them, and indexes them into
-Elasticsearch for visualization in Kibana.
+publishes records to Kafka, and writes them to Elasticsearch for visualization in Kibana —
+while simultaneously fanning out to a `LoggingSink` to demonstrate multiple sinks on the
+same topic.
 
 ---
 
@@ -18,89 +63,111 @@ Elasticsearch for visualization in Kibana.
    - [Elasticsearch & Kibana](#elasticsearch--kibana)
    - [Truststore for Elasticsearch TLS](#truststore-for-elasticsearch-tls)
 6. [Configuration](#configuration)
-   - [producer.properties](#producerproperties)
-   - [consumer.properties](#consumerproperties)
+   - [pipeline.properties](#pipelineproperties)
+   - [Routing: sources → topics → sinks](#routing-sources--topics--sinks)
+   - [Fan-out: one source to multiple sinks](#fan-out-one-source-to-multiple-sinks)
+   - [Dead Letter Queue (DLQ)](#dead-letter-queue-dlq)
+   - [Single Message Transforms (SMTs)](#single-message-transforms-smts)
    - [Message format](#message-format)
    - [Kafka security modes](#kafka-security-modes)
-7. [Building](#building)
-8. [Running](#running)
-   - [Producer](#producer)
-   - [Consumer](#consumer)
-9. [Integration Test](#integration-test)
-10. [Elasticsearch Index & Kibana](#elasticsearch-index--kibana)
-11. [Troubleshooting](#troubleshooting)
+   - [Health & Metrics](#health--metrics)
+7. [Adding a new Source, Sink, or Transform](#adding-a-new-source-sink-or-transform)
+8. [Building](#building)
+9. [Running](#running)
+10. [Integration Test](#integration-test)
+11. [Elasticsearch Index & Kibana](#elasticsearch-index--kibana)
+12. [Troubleshooting](#troubleshooting)
 
 ---
 
 ## Architecture
 
 ```
-+------------------------------------------------------------------+
-|  Producer JVM                                                    |
-|                                                                  |
-|  ProducerMain                                                    |
-|    |                                                             |
-|    +-- [shared] KafkaProducer<String, V>  (thread-safe)         |
-|    +-- [shared] DataFetcher               (Apache HttpClient)    |
-|    |                                                             |
-|    +-- ProducerWorker-0  --> polls ISS position API every 5 s   |
-+-----------------------------+------------------------------------+
-                              |  Kafka topic: open-notify-iss
-                              |  (2 partitions, replication factor 1)
-                              v
-                    +-----------------+
-                    |  Apache Kafka   |
-                    |  localhost:9092 |
-                    +--------+--------+
-                             |
-+----------------------------v-------------------------------------+
-|  Consumer JVM                                                    |
-|                                                                  |
-|  ConsumerMain                                                    |
-|    |                                                             |
-|    +-- ConsumerWorker-0  (owns KafkaConsumer, 1 partition)       |
-|    +-- ConsumerWorker-1  (owns KafkaConsumer, 1 partition)       |
-|         |                                                        |
-|         +-- ElasticsearchSink --> HTTPS, basic auth, JKS TLS    |
-+-----------------------------+------------------------------------+
-                              |
-                    +---------v--------+
-                    |  Elasticsearch   |
-                    |  localhost:9200  |
-                    +---------+--------+
-                              |
-                    +---------v--------+
-                    |     Kibana       |
-                    |  localhost:5601  |
-                    +------------------+
+config/pipeline.properties
+         |
+         v
+  PipelineMain  (discovers Source/Sink impls via ServiceLoader)
+         |
+         +---------- SourceRunner (per source instance)
+         |                |
+         |                +-- IssApiSource     --> polls ISS API every 5 s
+         |                +-- HttpListenerSource --> accepts HTTP POST (FluentBit etc.)
+         |                |
+         |                +-- KafkaProducer<String, V>  [shared, thread-safe]
+         |
+         +---------- SinkRunner (per sink instance)
+                          |
+                          +-- ConsumerWorker threads, each with own KafkaConsumer
+                          |        |
+                          |        v
+                          |   Sink.writeBatch(List<Record>)  [one bulk request]
+                          |        |
+                          |        +-- ElasticsearchSink  (Bulk API, HTTPS, auth, TLS)
+                          |        +-- LoggingSink         (Log4j2)
+                          |
+                          +-- DLQ KafkaProducer (optional, one per SinkRunner)
+```
+
+```
+  Sources                Kafka Broker           Sinks
+  ───────                ────────────           ─────
+  IssApiSource  ──┐                    ┌──── ElasticsearchSink  (group: iss-es-consumer)
+                  ├─► open-notify-iss ─┤
+  HttpListener  ──┘                    └──── LoggingSink         (group: iss-log-consumer)
+
+  (fan-out: two sinks subscribe to the same topic in different consumer groups)
 ```
 
 ### Threading model
 
-| Component | Thread count | Thread safety |
+| Component | Threads | Thread safety |
 |---|---|---|
-| `KafkaProducer` | Shared across all producer workers | Thread-safe — one send buffer and TCP connection per broker |
-| `DataFetcher` (HttpClient) | Shared across all producer workers | Thread-safe — pooled connections |
-| `KafkaConsumer` | One per consumer worker | NOT thread-safe — never shared |
-| `ElasticsearchSink` | One per consumer worker | Thread-safe internally but scoped to one worker |
+| `KafkaProducer` | One per `SourceRunner`, shared across source threads | Thread-safe |
+| `Source` impl | Runs in one thread managed by `SourceRunner` | Impl-specific |
+| `KafkaConsumer` | One per `SinkRunner` worker thread — never shared | NOT thread-safe |
+| `Sink` impl | Shared across all `SinkRunner` worker threads | Must be thread-safe |
+| DLQ `KafkaProducer` | One per `SinkRunner`, shared across worker threads | Thread-safe |
 
 ### Delivery semantics
 
-- **Producer** — `acks=all` + `enable.idempotence=true` gives exactly-once delivery to the broker (no duplicates on retry).
-- **Consumer** — synchronous `commitSync()` after each poll batch gives at-least-once delivery to Elasticsearch. Document IDs are `<topic>-<partition>-<offset>`, so re-indexing the same record is idempotent.
+- **Producer** — `acks=all` + `enable.idempotence=true` gives exactly-once delivery to the broker.
+- **Consumer** — synchronous `commitSync()` after each poll batch gives at-least-once delivery. Document IDs `<topic>-<partition>-<offset>` make Elasticsearch re-indexing idempotent.
+- **Elasticsearch writes** — the full poll batch is sent in a single Bulk API request. Per-item failure checking is performed only when a DLQ is configured.
 
 ---
 
 ## Features
 
-- **Multi-threaded producer and consumer** — thread count controlled by properties file; no code changes needed.
-- **Three message format modes** — JSON (default), Avro with file-based schema, or Avro with Confluent Schema Registry.
-- **Generic workers** — `ProducerWorker<V>` and `ConsumerWorker<V>` handle any value type via injected converter functions; no parallel class hierarchies needed for new formats.
-- **Four Kafka security modes** — PLAINTEXT, SSL, SASL_PLAINTEXT, SASL_SSL; switched purely by properties.
-- **Elasticsearch HTTPS + basic auth + JKS truststore** — all configured via `consumer.properties`.
-- **Daily rolling Elasticsearch index** — uses date-math index name `<iss-positions-{now/d{yyyy-MM-dd}}>`.
-- **`recordTimestamp` enrichment** — the Unix epoch `timestamp` field from the ISS API is transparently converted to an ISO-8601 string and added to every document before indexing.
-- **Graceful shutdown** — JVM shutdown hook stops workers cleanly, flushes the producer, and closes all resources.
+- **SPI-based plugin architecture** — new source and sink types are registered in
+  `META-INF/services/` and require no changes to the framework.
+- **Multi-threaded sources and sinks** — thread counts are configured per instance in
+  `pipeline.properties`; no code changes needed.
+- **Flexible routing** — sources publish to topics; sinks subscribe to topics.
+  Fan-out (one source to multiple sinks) and multiple isolated pipelines are both
+  supported through standard Kafka consumer groups.
+- **Bulk Elasticsearch writes** — entire poll batches are sent in a single HTTP request;
+  per-item failure tracking is only enabled when a DLQ is configured.
+- **Dead Letter Queue (DLQ)** — configurable per sink; failed records are routed to a
+  dedicated Kafka topic for inspection and replay.
+- **Single Message Transforms (SMTs)** — payload-only transform chain on both source and
+  sink side, configured per instance via `transforms=<type1>,<type2>,...`. Built-in:
+  `inject-record-timestamp` (reads the payload's Unix epoch `timestamp` and adds
+  `recordTimestamp` as ISO-8601). A `null` return from any transform silently drops the
+  record. Extend by implementing `Transform`, registering it in
+  `META-INF/services/io.github.adityassharma.kafka.spi.Transform`.
+- **Three message format modes** — JSON (default), Avro with file-based schema, Avro with
+  Confluent Schema Registry.
+- **Four Kafka security modes** — PLAINTEXT, SSL, SASL\_PLAINTEXT, SASL\_SSL; switched
+  purely by properties.
+- **Elasticsearch HTTPS + basic auth + JKS truststore** — all configured in
+  `pipeline.properties`.
+- **Daily rolling Elasticsearch index** — date-math index name `<iss-positions-{now/d{yyyy-MM-dd}}>`.
+- **Graceful shutdown** — JVM shutdown hook stops all sources and sinks cleanly, flushes
+  producers, commits final offsets, and closes all resources.
+- **Built-in health & metrics endpoints** — optional lightweight HTTP server (JDK built-in,
+  zero new dependencies) exposing `GET /health` (JSON component status) and `GET /metrics`
+  (Prometheus plaintext consumer-lag gauges). Enabled by adding `management.port` to any
+  properties file; works in all three deployment modes independently.
 
 ---
 
@@ -111,14 +178,13 @@ Elasticsearch for visualization in Kibana.
 | Java (JDK) | 25 | `JAVA_HOME` must be set |
 | Maven | 3.9 | Used to build and run tests |
 | Apache Kafka | 4.2.0 | Broker + CLI scripts; KRaft mode (no ZooKeeper) |
-| Elasticsearch | 8.x / 9.x | HTTPS recommended; HTTP also supported |
+| Elasticsearch | 9.x | HTTPS recommended; HTTP also supported |
 | Kibana | matching ES version | Optional — for visualization |
-| Confluent Schema Registry | 7.x | Optional — only for Avro + Schema Registry mode |
+| Confluent Schema Registry | 7.x | Optional — Avro + Schema Registry mode only |
 
 > **Local setup tip:** download the binary release from
 > [kafka.apache.org](https://kafka.apache.org/downloads) and unzip it (e.g. to `C:\kafka`
-> on Windows). Kafka 4.x uses KRaft mode — ZooKeeper is no longer required or bundled.
-> Elasticsearch and Kibana can be downloaded individually from
+> on Windows). Elasticsearch and Kibana can be downloaded individually from
 > [elastic.co/downloads](https://www.elastic.co/downloads).
 
 ---
@@ -128,29 +194,50 @@ Elasticsearch for visualization in Kibana.
 ```
 kafka-ingest-pipeline/
 ├── config/
-│   ├── producer.properties           # producer configuration
-│   ├── consumer.properties           # consumer + Elasticsearch configuration
+│   ├── pipeline.properties           # unified pipeline configuration
 │   └── elasticsearch.truststore.jks  # local-only, excluded from git (*.jks)
 ├── src/
 │   ├── main/java/.../kafka/
-│   │   ├── common/
-│   │   │   ├── AppProperties.java        # loads & validates .properties files
-│   │   │   ├── AvroConverter.java        # JSON <-> Avro GenericRecord
-│   │   │   ├── AvroFileDeserializer.java # Kafka Deserializer<GenericRecord> (file schema)
-│   │   │   ├── AvroFileSerializer.java   # Kafka Serializer<GenericRecord>   (file schema)
-│   │   │   ├── ElasticsearchSink.java    # ES client wrapper (HTTPS, auth, TLS)
-│   │   │   ├── KafkaClientFactory.java   # creates typed KafkaProducer/Consumer
-│   │   │   ├── MessageFormat.java        # JSON / AVRO enum
-│   │   │   └── SchemaLoader.java         # loads .avsc schema from file
-│   │   ├── producer/
-│   │   │   ├── DataFetcher.java          # HTTP GET -> JSON string
-│   │   │   ├── ProducerMain.java         # entry point, wires format + workers
-│   │   │   └── ProducerWorker.java       # generic poll-convert-publish loop
-│   │   └── consumer/
-│   │       ├── ConsumerMain.java         # entry point, wires format + workers
-│   │       └── ConsumerWorker.java       # generic poll-convert-index loop
-│   └── test/java/.../kafka/
-│       └── RoundTripIntegrationTest.java
+│   │   ├── spi/
+│   │   │   ├── Source.java           # source plugin interface
+│   │   │   ├── SourceContext.java    # framework handle passed to each source
+│   │   │   ├── Sink.java             # sink plugin interface
+│   │   │   ├── Record.java           # immutable record (topic/partition/offset/key/value/timestamp)
+│   │   │   └── Transform.java        # SMT interface + loadChain() factory
+│   │   ├── sources/
+│   │   │   ├── IssApiSource.java     # polls Open-Notify ISS position API
+│   │   │   ├── HttpListenerSource.java  # accepts HTTP POST (FluentBit etc.)
+│   │   │   └── util/
+│   │   │       └── DataFetcher.java  # HTTP GET helper used by polling sources
+│   │   ├── sinks/
+│   │   │   ├── ElasticsearchSink.java  # Bulk API writer with optional DLQ tracking
+│   │   │   └── LoggingSink.java        # logs records via Log4j2
+│   │   ├── transforms/
+│   │   │   └── InjectRecordTimestamp.java  # SMT: adds recordTimestamp (ISO-8601) from payload epoch
+│   │   ├── pipeline/
+│   │   │   ├── PipelineMain.java     # entry point — discovers and starts all runners
+│   │   │   ├── SourceRunner.java     # manages one source + its KafkaProducer
+│   │   │   └── SinkRunner.java       # manages one sink + its consumer thread pool
+│   │   ├── management/
+│   │   │   ├── ComponentStatus.java  # enum: STARTING, RUNNING, STOPPED, ERROR
+│   │   │   ├── SourceStats.java      # name, type, volatile status
+│   │   │   ├── SinkStats.java        # name, type, volatile status, per-partition lag map
+│   │   │   └── ManagementServer.java # JDK HttpServer: /health and /metrics
+│   │   └── common/
+│   │       ├── AppProperties.java        # loads & validates .properties files
+│   │       ├── AvroConverter.java        # JSON <-> Avro GenericRecord
+│   │       ├── AvroFileDeserializer.java # Kafka Deserializer<GenericRecord> (file schema)
+│   │       ├── AvroFileSerializer.java   # Kafka Serializer<GenericRecord>   (file schema)
+│   │       ├── KafkaClientFactory.java   # creates typed KafkaProducer/Consumer
+│   │       ├── MessageFormat.java        # JSON / AVRO enum
+│   │       └── SchemaLoader.java         # loads .avsc schema from file
+│   └── resources/
+│       └── META-INF/services/
+│           ├── io.github.adityassharma.kafka.spi.Source     # registered Source impls
+│           ├── io.github.adityassharma.kafka.spi.Sink        # registered Sink impls
+│           └── io.github.adityassharma.kafka.spi.Transform   # registered Transform impls
+├── src/test/java/.../kafka/
+│   └── RoundTripIntegrationTest.java
 ├── pom.xml
 └── README.md
 ```
@@ -162,15 +249,13 @@ kafka-ingest-pipeline/
 ### Kafka
 
 Kafka 4.x uses **KRaft mode** — ZooKeeper is no longer required or included.
-The storage layer must be formatted with a cluster ID once before the broker can start.
-The cluster metadata is persisted under the directory specified by `log.dir` in
-`config/server.properties` (default `C:\kafka\logs\kraft-combined-logs` on Windows).
+Format storage once before the first start.
 
 **1. Format storage (first time only)**
 
 ```bash
 # Linux/macOS
-bin/kafka-storage.sh random-uuid          # generates a cluster UUID, copy the output
+bin/kafka-storage.sh random-uuid
 bin/kafka-storage.sh format -t <uuid> -c config/server.properties --standalone
 
 # Windows (from C:\kafka)
@@ -178,45 +263,49 @@ bin\windows\kafka-storage.bat random-uuid
 bin\windows\kafka-storage.bat format -t <uuid> -c config\server.properties --standalone
 ```
 
-This step only needs to be done once. The `meta.properties` file written into the
-log directory will be reused on all subsequent starts.
-
 **2. Start the broker**
 
 ```bash
 # Linux/macOS
 bin/kafka-server-start.sh config/server.properties
 
-# Windows (from C:\kafka)
+# Windows
 bin\windows\kafka-server-start.bat config\server.properties
 ```
 
-**3. Create the topic**
+**3. Create topics**
 
 ```bash
-# Linux/macOS
+# Main topic (Linux/macOS)
 bin/kafka-topics.sh --create \
   --bootstrap-server localhost:9092 \
   --topic open-notify-iss \
   --partitions 2 \
   --replication-factor 1
 
-# Windows (from C:\kafka)
-bin\windows\kafka-topics.bat --create ^
-  --bootstrap-server localhost:9092 ^
-  --topic open-notify-iss ^
-  --partitions 2 ^
+# DLQ topic (only needed if sink.es-iss.dlq.topic is set)
+bin/kafka-topics.sh --create \
+  --bootstrap-server localhost:9092 \
+  --topic open-notify-iss-es-iss-dlq \
+  --partitions 1 \
   --replication-factor 1
+
+# Windows — replace bin/kafka-topics.sh with bin\windows\kafka-topics.bat
 ```
 
 **4. Verify**
 
 ```bash
-# Linux/macOS
-bin/kafka-topics.sh --describe --bootstrap-server localhost:9092 --topic open-notify-iss
+bin/kafka-topics.sh --list --bootstrap-server localhost:9092
+```
 
-# Windows
-bin\windows\kafka-topics.bat --describe --bootstrap-server localhost:9092 --topic open-notify-iss
+**Check consumer lag at any time**
+
+```bash
+bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 \
+  --describe \
+  --group open-notify-iss-consumer-group
 ```
 
 ---
@@ -226,68 +315,50 @@ bin\windows\kafka-topics.bat --describe --bootstrap-server localhost:9092 --topi
 **Start Elasticsearch**
 
 ```bash
-# Linux/macOS (from Elasticsearch install directory)
-bin/elasticsearch
-
-# Windows (from C:\elasticsearch)
-bin\elasticsearch.bat
+bin/elasticsearch          # Linux/macOS
+bin\elasticsearch.bat      # Windows
 ```
 
-Elasticsearch listens on `https://localhost:9200` by default with security enabled.
+Listens on `https://localhost:9200` with security enabled by default.
 
 **Start Kibana**
 
 ```bash
-# Linux/macOS (from Kibana install directory)
-bin/kibana
-
-# Windows (from C:\kibana)
-bin\kibana.bat
+bin/kibana          # Linux/macOS
+bin\kibana.bat      # Windows
 ```
 
-Kibana listens on `http://localhost:5601`.
+Listens on `http://localhost:5601`.
 
-**Reset the `elastic` user password** (first-time setup or if you need to change it):
+**Reset the `elastic` user password**
 
 ```bash
-# From the Elasticsearch install directory
 bin/elasticsearch-reset-password -u elastic        # Linux/macOS
 bin\elasticsearch-reset-password.bat -u elastic    # Windows
 ```
 
-Update `consumer.properties` with the password:
+Update `pipeline.properties`:
 
 ```properties
-elasticsearch.username=elastic
-elasticsearch.password=your-password-here
+sink.es-iss.elasticsearch.username=elastic
+sink.es-iss.elasticsearch.password=your-password-here
 ```
 
-**Set index replicas to 0** (single-node setup only — prevents yellow index status):
+**Set index replicas to 0** (single-node setup only):
 
 ```bash
-# Linux/macOS
 curl -X PUT "https://localhost:9200/open-notify-iss/_settings" \
   -u elastic:<password> \
   -H "Content-Type: application/json" \
   -d '{"index":{"number_of_replicas":0}}'
-
-# Windows (PowerShell — escape inner double quotes)
-curl -X PUT "https://localhost:9200/open-notify-iss/_settings" `
-  -u elastic:<password> `
-  -H "Content-Type: application/json" `
-  -d "{\"index\":{\"number_of_replicas\":0}}"
 ```
 
 ---
 
 ### Truststore for Elasticsearch TLS
 
-The Elasticsearch HTTPS certificate needs to be trusted by the Java consumer.
-Export the Elasticsearch CA certificate and import it into a JKS truststore:
-
 ```bash
-# The CA cert is typically at: <ES install dir>/config/certs/http_ca.crt
-
+# The CA cert is at: <ES install dir>/config/certs/http_ca.crt
 keytool -importcert \
   -alias elasticsearch-ca \
   -file /path/to/http_ca.crt \
@@ -296,83 +367,233 @@ keytool -importcert \
   -noprompt
 ```
 
-The `*.jks` file is excluded from version control via `.gitignore`.
-Each developer must generate their own truststore from their local Elasticsearch instance.
-
-Verify or update these properties in `consumer.properties`:
-
-```properties
-elasticsearch.scheme=https
-elasticsearch.ssl.truststore.location=config/elasticsearch.truststore.jks
-elasticsearch.ssl.truststore.password=changeit
-```
+The `*.jks` file is excluded from version control. Each developer generates their own
+from their local Elasticsearch instance.
 
 ---
 
 ## Configuration
 
-### producer.properties
+All configuration lives in a single **`config/pipeline.properties`** file.
+
+### pipeline.properties
+
+#### Global properties (apply to all sources and sinks)
 
 | Property | Default | Description |
 |---|---|---|
 | `bootstrap.servers` | *(required)* | Kafka broker address(es) |
-| `topic.name` | *(required)* | Topic to produce to |
-| `num.producer.threads` | *(required)* | Number of producer worker threads |
-| `data.source.iss.position` | *(required)* | ISS position API URL |
-| `polling.interval.ms` | `5000` | How often each worker polls the API (ms) |
 | `message.format` | `json` | `json` or `avro` |
-| `message.schema.file` | — | Path to `.avsc` schema file (Avro file mode) |
-| `message.schema.registry.url` | — | Schema Registry URL (Avro registry mode) |
-| `acks` | `1` | Producer acknowledgement (`all` required for idempotence) |
-| `enable.idempotence` | — | `true` prevents duplicate messages on retry |
-| `compression.type` | `none` | `none`, `snappy`, `lz4`, `gzip`, `zstd` |
+| `message.schema.file` | — | Avro file-based schema path |
+| `message.schema.registry.url` | — | Confluent Schema Registry URL |
+| `acks` | `1` | Producer acknowledgement level |
+| `enable.idempotence` | — | `true` prevents duplicate messages on producer retry |
+| `compression.type` | `none` | `snappy`, `lz4`, `gzip`, `zstd`, `none` |
+| `security.protocol` | *(absent = PLAINTEXT)* | See [Kafka security modes](#kafka-security-modes) |
+| `management.port` | *(absent = disabled)* | TCP port for `/health` and `/metrics`; omit to disable |
 
-### consumer.properties
+#### Source instance properties (`source.<name>.*`)
+
+| Property | Description |
+|---|---|
+| `source.<name>.type` | Source type: `iss-api` or `http-listener` |
+| `source.<name>.topic` | Kafka topic to publish to |
+| `source.<name>.transforms` | Comma-separated SMT chain applied before producing (optional) |
+
+**`iss-api` additional properties:**
 
 | Property | Default | Description |
 |---|---|---|
-| `bootstrap.servers` | *(required)* | Kafka broker address(es) |
-| `group.id` | *(required)* | Consumer group ID |
-| `topic.name` | *(required)* | Topic to consume from |
-| `num.consumer.threads` | *(required)* | Worker threads (must be <= partition count) |
-| `message.format` | `json` | `json` or `avro` — must match the producer |
-| `message.schema.file` | — | Path to `.avsc` schema file (Avro file mode) |
-| `message.schema.registry.url` | — | Schema Registry URL (Avro registry mode) |
-| `auto.offset.reset` | `earliest` | `earliest` or `latest` |
-| `elasticsearch.host` | `localhost` | Elasticsearch hostname |
-| `elasticsearch.port` | `9200` | Elasticsearch port |
-| `elasticsearch.scheme` | `http` | `http` or `https` |
-| `elasticsearch.index` | *(required)* | Index name; date-math syntax supported |
-| `elasticsearch.username` | — | Basic auth username |
-| `elasticsearch.password` | — | Basic auth password |
-| `elasticsearch.ssl.truststore.location` | — | JKS truststore path (HTTPS only) |
-| `elasticsearch.ssl.truststore.password` | — | Truststore password |
+| `source.<name>.url` | *(required)* | HTTP endpoint to poll |
+| `source.<name>.polling.interval.ms` | `5000` | Sleep between polls (ms) |
+
+**`http-listener` additional properties:**
+
+| Property | Default | Description |
+|---|---|---|
+| `source.<name>.port` | `8080` | TCP port to listen on |
+| `source.<name>.path` | `/ingest` | URL path to accept POSTs on |
+| `source.<name>.threads` | `4` | HTTP handler thread pool size |
+
+#### Sink instance properties (`sink.<name>.*`)
+
+| Property | Default | Description |
+|---|---|---|
+| `sink.<name>.type` | *(required)* | Sink type: `elasticsearch` or `logging` |
+| `sink.<name>.topics` | *(required)* | Comma-separated Kafka topics to consume from |
+| `sink.<name>.group.id` | *(required)* | Kafka consumer group ID (must be unique per sink) |
+| `sink.<name>.threads` | `1` | Consumer worker threads (≤ partition count) |
+| `sink.<name>.auto.offset.reset` | `earliest` | `earliest` or `latest` |
+| `sink.<name>.dlq.topic` | *(absent = disabled)* | DLQ Kafka topic name; omit to disable DLQ |
+| `sink.<name>.transforms` | *(absent = none)* | Comma-separated SMT chain applied before `writeBatch()` |
+
+**`elasticsearch` additional properties:**
+
+| Property | Default | Description |
+|---|---|---|
+| `sink.<name>.elasticsearch.host` | `localhost` | Elasticsearch hostname |
+| `sink.<name>.elasticsearch.port` | `9200` | Elasticsearch port |
+| `sink.<name>.elasticsearch.scheme` | `http` | `http` or `https` |
+| `sink.<name>.elasticsearch.index` | *(required)* | Index name; date-math syntax supported |
+| `sink.<name>.elasticsearch.username` | — | Basic auth username |
+| `sink.<name>.elasticsearch.password` | — | Basic auth password |
+| `sink.<name>.elasticsearch.ssl.truststore.location` | — | JKS truststore path |
+| `sink.<name>.elasticsearch.ssl.truststore.password` | — | Truststore password |
+
+**`logging` additional properties:**
+
+| Property | Default | Description |
+|---|---|---|
+| `sink.<name>.log.level` | `INFO` | Log4j2 level: TRACE, DEBUG, INFO, WARN, ERROR |
+
+---
+
+### Routing: sources → topics → sinks
+
+Routing is topic-based and works like standard Kafka:
+
+```
+source.iss-position.topic=open-notify-iss   → publishes to open-notify-iss
+sink.es-iss.topics=open-notify-iss          → consumes from open-notify-iss
+```
+
+Sources write to topics; sinks subscribe to topics. The framework imposes no
+additional routing layer.
+
+### Fan-out: one source to multiple sinks
+
+Point multiple sinks at the same topic, each with its **own consumer group ID**:
+
+```properties
+sinks=es-iss,log-iss
+
+sink.es-iss.topics=open-notify-iss
+sink.es-iss.group.id=open-notify-iss-es-consumer      # ← different group IDs
+
+sink.log-iss.topics=open-notify-iss
+sink.log-iss.group.id=open-notify-iss-log-consumer    # ← ensure independent offset tracking
+```
+
+Each consumer group receives all records independently — standard Kafka behaviour.
+
+### Dead Letter Queue (DLQ)
+
+Add `dlq.topic` to any sink to enable DLQ routing for that sink:
+
+```properties
+sink.es-iss.dlq.topic=open-notify-iss-es-iss-dlq
+```
+
+**When DLQ is enabled:**
+- `ElasticsearchSink` inspects each item in the Bulk response and returns failed records.
+- `SinkRunner` publishes each failed record (original JSON) to the DLQ topic.
+- Offsets are committed after DLQ routing, so the main topic advances regardless.
+
+**When DLQ is disabled** (property absent):
+- `ElasticsearchSink` only checks the top-level `errors` boolean in the Bulk response (O(1)).
+- Failures are logged and skipped.
+
+Create the DLQ topic before starting the pipeline:
+
+```bash
+bin/kafka-topics.sh --create \
+  --bootstrap-server localhost:9092 \
+  --topic open-notify-iss-es-iss-dlq \
+  --partitions 1 \
+  --replication-factor 1
+```
+
+### Single Message Transforms (SMTs)
+
+SMTs let you transform a record's JSON payload before it is produced to Kafka (source-side)
+or before it is written to the sink (sink-side). Transforms are applied in declaration order;
+a transform that returns `null` silently drops the record (it is not sent to Kafka / written
+to the sink, and is not routed to the DLQ).
+
+Configure a comma-separated chain on any source or sink instance:
+
+```properties
+# source-side — applied before producing to Kafka
+source.iss-position.transforms=inject-record-timestamp
+
+# sink-side — applied before writeBatch()
+sink.es-iss.transforms=inject-record-timestamp
+
+# chained (left-to-right; null from any step drops the record)
+sink.es-iss.transforms=inject-record-timestamp,mask-pii
+```
+
+**Important:** transforms operate on the JSON payload string only. Kafka metadata
+(topic, partition, offset, key, timestamp) is **not** visible to transforms and is
+passed through unchanged. This means:
+- Source-side transforms apply before the record is produced, so the Kafka-assigned
+  metadata is not yet available — only the raw payload.
+- Sink-side transforms apply after consumption; the document ID
+  `<topic>-<partition>-<offset>` is derived from the original metadata, so
+  Elasticsearch re-indexing remains idempotent even after transformation.
+
+#### Conversion order — where transforms fit
+
+**Source side:**
+
+```
+source.emit(json)
+  → applyTransformChain()          [transforms run here — JSON string in, JSON string out]
+  → (JSON) ── message.format=json ──► producer.send()  → Kafka
+  → (JSON) ── message.format=avro ──► AvroConverter.fromJson()  → GenericRecord
+                                    → producer.send()  → Kafka (Avro binary)
+```
+
+**Sink side:**
+
+```
+Kafka
+  → consumer.poll()
+  → (String)       ── message.format=json ──► Record.value = raw JSON
+  → (GenericRecord) ─ message.format=avro ──► AvroConverter.toJson()  → Record.value = JSON
+  → applyTransforms()              [transforms run here — JSON string in, JSON string out]
+  → sink.writeBatch()
+```
+
+**Avro constraint on the source side:** transforms run *before* `AvroConverter.fromJson()`
+converts the JSON to a `GenericRecord`. That conversion is strict — any field in the JSON
+that is not declared in the Avro schema throws an exception. Transforms that add new fields
+(e.g. `inject-record-timestamp`) will fail on the source side unless the new field is
+declared in the `.avsc` file. On the **sink side there is no such constraint** — the Avro
+decode happens before transforms run, so the JSON is already free-form at that point.
+
+#### Built-in transforms
+
+| Type | Description |
+|---|---|
+| `inject-record-timestamp` | Reads `timestamp` (Unix epoch seconds) from the payload and adds `recordTimestamp` as an ISO-8601 string. If `timestamp` is absent or not numeric, the payload is forwarded unchanged. Never drops a record. |
+
+#### Adding a custom transform
+
+See [Adding a new Transform](#adding-a-new-source-sink-or-transform) below.
+
+---
 
 ### Message format
 
-Controlled by `message.format` in both properties files.
-
 | Value | Serialization | Extra properties required |
 |---|---|---|
-| `json` (default) | Raw JSON string, no schema | None |
+| `json` (default) | Raw JSON string | None |
 | `avro` + `message.schema.file` | Avro binary, file-based schema | `message.schema.file=/path/to/schema.avsc` |
-| `avro` + `message.schema.registry.url` | Avro binary, Confluent Schema Registry | `message.schema.registry.url=http://localhost:8081` |
-
-The producer and consumer must use **the same format and the same schema**.
+| `avro` + `message.schema.registry.url` | Avro binary, Schema Registry | `message.schema.registry.url=http://localhost:8081` |
 
 ### Kafka security modes
 
-Controlled by `security.protocol` (and supporting properties) in each properties file.
-Uncomment exactly one block in `producer.properties` and `consumer.properties`.
+Uncomment exactly one block in `pipeline.properties`.
 
-| Mode | `security.protocol` | Encryption | Authentication | Extra properties needed |
-|---|---|---|---|---|
-| 1 — Local dev (default) | *(absent)* | None | None | Nothing — works out of the box |
-| 2 — TLS only | `SSL` | TLS | None (one-way cert validation) | `ssl.truststore.*`; add `ssl.keystore.*` for mTLS |
-| 3 — SASL, no TLS | `SASL_PLAINTEXT` | None | Username + password | `sasl.mechanism` + `sasl.jaas.config` |
-| 4 — SASL over TLS | `SASL_SSL` | TLS | Username + password | `ssl.truststore.*` + `sasl.mechanism` + `sasl.jaas.config` |
+| Mode | `security.protocol` | Encryption | Authentication |
+|---|---|---|---|
+| 1 — Local dev (default) | *(absent)* | None | None |
+| 2 — TLS only | `SSL` | TLS | None (one-way cert) |
+| 3 — SASL, no TLS | `SASL_PLAINTEXT` | None | Username + password |
+| 4 — SASL over TLS | `SASL_SSL` | TLS | Username + password |
 
-**PLAIN mechanism example** (credentials stored on the broker):
+**SASL\_SSL example:**
 
 ```properties
 security.protocol=SASL_SSL
@@ -384,25 +605,108 @@ sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule require
   password="aditya-secret";
 ```
 
-**SCRAM-SHA-256 example** (broker must have SCRAM credentials stored):
+### Health & Metrics
+
+Add `management.port` to any properties file to enable the built-in HTTP server.
+No new dependencies — it uses the JDK's `com.sun.net.httpserver.HttpServer`.
 
 ```properties
-security.protocol=SASL_SSL
-ssl.truststore.location=/path/to/client.truststore.jks
-ssl.truststore.password=changeit
-sasl.mechanism=SCRAM-SHA-256
-sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required \
-  username="aditya" \
-  password="aditya-secret";
+management.port=8081   # pipeline.properties / source.properties
+management.port=8082   # sink.properties (different port when both run on the same host)
 ```
 
-For mTLS (broker also validates the client certificate) add the keystore properties
-to any SSL or SASL_SSL block:
+**`GET /health`** — JSON component status:
 
-```properties
-ssl.keystore.location=/path/to/client.keystore.jks
-ssl.keystore.password=changeit
-ssl.key.password=changeit
+```json
+{
+  "status": "UP",
+  "sources": [
+    {"name": "iss-position", "type": "iss-api",       "status": "RUNNING"},
+    {"name": "fluentbit",    "type": "http-listener",  "status": "RUNNING"}
+  ],
+  "sinks": [
+    {"name": "es-iss",  "type": "elasticsearch", "status": "RUNNING"},
+    {"name": "log-iss", "type": "logging",        "status": "RUNNING"}
+  ]
+}
+```
+
+Overall `status` is `UP` when all components are `RUNNING`, `ERROR` if any are in error,
+or `STARTING` otherwise.
+
+**`GET /metrics`** — Prometheus plaintext consumer-lag gauges:
+
+```
+# HELP kafka_consumer_lag Messages behind the latest offset
+# TYPE kafka_consumer_lag gauge
+kafka_consumer_lag{sink="es-iss",topic="open-notify-iss",partition="0"} 0
+kafka_consumer_lag{sink="es-iss",topic="open-notify-iss",partition="1"} 0
+```
+
+Lag is sampled from the in-memory metadata piggy-backed on Kafka fetch responses —
+no extra broker requests, zero polling overhead.  Gauges are populated after the first
+successful `poll()` in each worker thread; until then no entries appear.
+
+**Deployment note:** health and metrics work independently per JVM.  In the
+separate-server deployment (Options 2 and 3), each JVM exposes its own endpoint
+and only reports its own sources or sinks.
+
+---
+
+## Adding a new Source, Sink, or Transform
+
+### New Source
+
+1. Create a class in `sources/` that implements `io.github.adityassharma.kafka.spi.Source`.
+2. Implement `type()` (unique string), `start(SourceContext)`, `stop()`, and `close()`.
+3. Call `context.emit(topic, jsonString)` to publish a record. Kafka serialisation is handled by the framework.
+4. Add the fully-qualified class name to `src/main/resources/META-INF/services/io.github.adityassharma.kafka.spi.Source`.
+5. Add a source instance block to `pipeline.properties`.
+
+### New Sink
+
+1. Create a class in `sinks/` that implements `io.github.adityassharma.kafka.spi.Sink`.
+2. Implement `type()`, `configure(Properties)`, `writeBatch(List<Record>)`, and `close()`.
+3. In `writeBatch`: send the batch to your destination; return a list of failed `Record`s (empty if all succeeded). Check `props.getProperty("dlq.topic") != null` in `configure()` to decide whether per-item failure tracking is needed.
+4. Ensure the implementation is **thread-safe** — a single instance is shared across all worker threads.
+5. Add the fully-qualified class name to `src/main/resources/META-INF/services/io.github.adityassharma.kafka.spi.Sink`.
+6. Add a sink instance block to `pipeline.properties`.
+
+### New Transform
+
+1. Create a class in `transforms/` that implements `io.github.adityassharma.kafka.spi.Transform`.
+2. Implement three methods:
+   - `type()` — unique kebab-case string used in `transforms=...` config (e.g. `"mask-pii"`).
+   - `apply(String json)` — receive the JSON payload; return the transformed string, or `null` to drop the record.
+   - `close()` — release any resources (no-op for stateless transforms).
+3. Design for **thread safety** — a single instance may be called concurrently from multiple worker threads.
+4. Add the fully-qualified class name to
+   `src/main/resources/META-INF/services/io.github.adityassharma.kafka.spi.Transform`.
+5. Reference it by type name in `pipeline.properties`:
+   ```properties
+   source.my-source.transforms=mask-pii
+   sink.my-sink.transforms=inject-record-timestamp,mask-pii
+   ```
+
+**Example skeleton:**
+
+```java
+package io.github.adityassharma.kafka.transforms;
+
+import io.github.adityassharma.kafka.spi.Transform;
+
+public class MaskPii implements Transform {
+
+    @Override public String type() { return "mask-pii"; }
+
+    @Override
+    public String apply(String json) {
+        // manipulate JSON string; return null to drop the record
+        return json.replaceAll("\"email\":\"[^\"]+\"", "\"email\":\"***\"");
+    }
+
+    @Override public void close() { /* stateless */ }
+}
 ```
 
 ---
@@ -414,65 +718,70 @@ mvn clean package
 ```
 
 Produces `target/kafka-ingest-pipeline-1.0.0-fat.jar` — a single uber-jar with all
-dependencies bundled via the Maven Shade Plugin. The jar has no `Main-Class` manifest
-entry; the entry point is chosen at runtime via `-cp`.
+dependencies bundled. The `ServicesResourceTransformer` in the Maven Shade Plugin
+ensures `META-INF/services/` entries from all JARs are merged, so `ServiceLoader`
+works correctly in the fat jar.
 
 ---
 
 ## Running
 
-Both producer and consumer accept a single argument: the path to their properties file.
+`PipelineMain` accepts a single argument — the path to a properties file.
+The `sources` and `sinks` keys are both **optional**: if absent or empty the node simply
+skips that side.  This supports three deployment configurations:
 
-### Producer
-
-```bash
-# Linux/macOS
-java -cp target/kafka-ingest-pipeline-1.0.0-fat.jar \
-  io.github.adityassharma.kafka.producer.ProducerMain \
-  config/producer.properties
-
-# Windows
-java -cp target\kafka-ingest-pipeline-1.0.0-fat.jar io.github.adityassharma.kafka.producer.ProducerMain config\producer.properties
-```
-
-Each worker thread polls the ISS position API every `polling.interval.ms` milliseconds
-and publishes the raw JSON to the Kafka topic. The `KafkaProducer` is shared across all
-workers (thread-safe; one TCP connection per broker).
-
-Send `SIGINT` (Ctrl-C) to trigger graceful shutdown — the producer flushes in-flight
-messages, closes cleanly, then exits.
-
-### Consumer
+### Option 1 — single server, single JVM (combined)
 
 ```bash
 # Linux/macOS
 java -cp target/kafka-ingest-pipeline-1.0.0-fat.jar \
-  io.github.adityassharma.kafka.consumer.ConsumerMain \
-  config/consumer.properties
+  io.github.adityassharma.kafka.pipeline.PipelineMain \
+  config/pipeline.properties
 
 # Windows
-java -cp target\kafka-ingest-pipeline-1.0.0-fat.jar io.github.adityassharma.kafka.consumer.ConsumerMain config\consumer.properties
+java -cp target\kafka-ingest-pipeline-1.0.0-fat.jar io.github.adityassharma.kafka.pipeline.PipelineMain config\pipeline.properties
 ```
 
-Each worker thread owns its own `KafkaConsumer` (not thread-safe; never shared),
-subscribes to the topic via the group protocol, and indexes every record into
-Elasticsearch. Offsets are committed synchronously after every poll batch
-(at-least-once delivery).
+### Option 2 — separate servers (source node + sink node)
 
-Before indexing, `ElasticsearchSink` adds a `recordTimestamp` field (ISO-8601)
-derived from the `timestamp` Unix epoch field in the ISS JSON payload.
+Both nodes must point `bootstrap.servers` at the same Kafka cluster.
 
-Document IDs are `<topic>-<partition>-<offset>`, making re-indexing idempotent.
+**Source node** (producer / ingestion server):
+```bash
+java -cp target/kafka-ingest-pipeline-1.0.0-fat.jar \
+  io.github.adityassharma.kafka.pipeline.PipelineMain \
+  config/source.properties
+```
 
-Send `SIGINT` (Ctrl-C) to shut down — workers finish their current poll batch,
-commit offsets, and close.
+**Sink node** (consumer / indexing server):
+```bash
+java -cp target/kafka-ingest-pipeline-1.0.0-fat.jar \
+  io.github.adityassharma.kafka.pipeline.PipelineMain \
+  config/sink.properties
+```
+
+### Option 3 — same server, separate JVMs
+
+Run the two commands above on the same machine to keep source and sink tuning
+(heap size, GC settings) independent.
+
+---
+
+`PipelineMain` always starts sinks before sources to avoid dropping records published
+before consumers are ready. Send `SIGINT` (Ctrl-C) to trigger graceful shutdown —
+sources stop polling, in-flight messages are flushed, consumer workers finish their
+current batch, commit offsets, and all resources are closed cleanly.
+
+**Disable the FluentBit HTTP listener** (if port 8080 is unavailable or not needed):
+remove `fluentbit` from the `sources=` list in the relevant properties file.
 
 ---
 
 ## Integration Test
 
 `RoundTripIntegrationTest` produces 10 synthetic ISS-like messages to Kafka and verifies
-that all 10 are received back by a consumer, checking both count and content.
+that all 10 are received back, checking both count and content. It tests the raw Kafka
+round-trip independently of the SPI layer.
 
 **Prerequisites:**
 - Kafka running on `localhost:9092`
@@ -483,12 +792,9 @@ that all 10 are received back by a consumer, checking both count and content.
 mvn test -Pintegration
 ```
 
-Unit tests are skipped by default (`skipTests=true` in `pom.xml`).
-The `integration` Maven profile re-enables Surefire.
-
-The test uses `assign()` + `seekToEnd()` + `position()` (instead of `subscribe()`)
-to avoid the asynchronous group-rebalance race condition: the consumer is deterministically
-positioned at the end of each partition before the producer sends anything.
+Unit tests are skipped by default (`skipTests=true` in `pom.xml`); the `integration`
+Maven profile re-enables Surefire. The test uses `assign()` + `seekToEnd()` + `position()`
+to avoid the asynchronous group-rebalance race condition.
 
 ---
 
@@ -496,22 +802,25 @@ positioned at the end of each partition before the producer sends anything.
 
 ### Index naming
 
-The default index name in `consumer.properties` uses Elasticsearch date-math syntax:
+The default index uses Elasticsearch date-math syntax:
 
 ```
 <iss-positions-{now/d{yyyy-MM-dd}}>
 ```
 
-This resolves to a daily index such as `iss-positions-2026-05-12`. A new index is
-created automatically at midnight; no manual index management is required.
-
-To use a static index name instead:
+This resolves to a daily index such as `iss-positions-2026-05-12`.  To use a static name:
 
 ```properties
-elasticsearch.index=iss-positions
+sink.es-iss.elasticsearch.index=iss-positions
 ```
 
 ### Creating a Kibana data view
+
+> **Prerequisite:** `recordTimestamp` is added to each document by the
+> `inject-record-timestamp` SMT.  Confirm `sink.es-iss.transforms=inject-record-timestamp`
+> is **uncommented** in `config/sink.properties` (it is enabled by default).  If the line
+> is commented out, documents will not contain the field and Kibana's time filter will
+> never match any records.
 
 1. Open Kibana → **Management → Stack Management → Data Views**
 2. Click **Create data view**
@@ -524,7 +833,7 @@ elasticsearch.index=iss-positions
 | Field | Type | Description |
 |---|---|---|
 | `timestamp` | `long` | Unix epoch seconds from the ISS API |
-| `recordTimestamp` | `date` | ISO-8601 version of `timestamp`, added by the consumer |
+| `recordTimestamp` | `date` | ISO-8601 version of `timestamp`, added before indexing |
 | `iss_position.latitude` | `text` | ISS latitude |
 | `iss_position.longitude` | `text` | ISS longitude |
 | `message` | `text` | API status (`"success"`) |
@@ -533,36 +842,74 @@ elasticsearch.index=iss-positions
 
 ## Troubleshooting
 
-**Consumer starts but receives no messages**
-- Confirm the producer is running and `topic.name` matches in both properties files.
-- Check `auto.offset.reset=earliest` in `consumer.properties` if you want to replay
-  messages already in the topic.
-- Verify `num.consumer.threads` is not greater than the number of partitions — excess
+**No Source implementation found for type='...'**
+- Check that the type value in `pipeline.properties` exactly matches the string returned
+  by `Source.type()` in your implementation.
+- Confirm the class is listed in
+  `src/main/resources/META-INF/services/io.github.adityassharma.kafka.spi.Source`.
+- Rebuild the fat jar — `ServicesResourceTransformer` must run to merge service files.
+
+**No Transform implementation found for type='...'**
+- Confirm the type name in `transforms=...` exactly matches the string returned by
+  `Transform.type()` in your implementation.
+- Confirm the class is listed in
+  `src/main/resources/META-INF/services/io.github.adityassharma.kafka.spi.Transform`.
+- Rebuild the fat jar so `ServicesResourceTransformer` merges the service file.
+
+**Sink receives no messages**
+- Confirm `sink.<name>.topics` matches the topic the source publishes to.
+- Check `auto.offset.reset=earliest` if you want to replay messages already in the topic.
+- Verify `sink.<name>.threads` is not greater than the number of topic partitions — excess
   threads receive no partition assignment and sit idle.
 
+**Port 8080 already in use**
+- Either change `source.fluentbit.port` or remove `fluentbit` from the `sources=` list.
+
 **`ConfigException: Must set acks to all in enable.idempotence=true`**
-- Set `acks=all` in `producer.properties`. Idempotent producers require all in-sync
-  replicas to acknowledge.
+- Set `acks=all` in `pipeline.properties`.
 
 **`Connection is closed` or SSL handshake errors (Elasticsearch)**
-- Confirm `elasticsearch.scheme=https` in `consumer.properties`.
+- Confirm `elasticsearch.scheme=https` in `pipeline.properties`.
 - Confirm the JKS truststore contains the Elasticsearch CA certificate.
-- Verify the truststore path and password.
-
-**`NoClassDefFoundError` when running from IntelliJ**
-- Run using the fat jar instead of the IDE classpath:
-  ```bash
-  java -cp target/kafka-ingest-pipeline-1.0.0-fat.jar \
-    io.github.adityassharma.kafka.consumer.ConsumerMain \
-    config/consumer.properties
-  ```
 
 **Yellow Elasticsearch index status**
-- Single-node clusters cannot satisfy the default replica count of 1.
-  Set replicas to 0 (see [Elasticsearch & Kibana setup](#elasticsearch--kibana)).
+- Single-node clusters cannot satisfy the default replica count of 1. Set replicas to 0
+  (see [Elasticsearch & Kibana setup](#elasticsearch--kibana)).
+
+**DLQ topic does not exist**
+- Create the DLQ topic before starting the pipeline, or set
+  `auto.create.topics.enable=true` on the Kafka broker (not recommended for production).
+
+**Check consumer lag**
+```bash
+bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 \
+  --describe \
+  --group open-notify-iss-consumer-group
+```
 
 **Integration test receives 0 messages**
-- Confirm the topic exists: `kafka-topics.sh --describe --bootstrap-server localhost:9092 --topic open-notify-iss`
-- The test uses `assign()` + `seekToEnd()` which resolves positions before the producer
-  sends, so a rebalance race is not the cause — the topic simply must exist with at
-  least 1 partition.
+- Confirm the topic exists:
+  ```bash
+  bin/kafka-topics.sh --describe --bootstrap-server localhost:9092 --topic open-notify-iss
+  ```
+
+**`/health` returns `STARTING` immediately after launch**
+- Sources and sinks transition to `RUNNING` as their threads start.
+  Allow a few seconds after the pipeline log line `Pipeline running: N source(s), N sink(s)`.
+
+**Port conflict on `management.port`**
+- Use different ports when two JVMs run on the same host
+  (e.g. `8081` in `source.properties` and `8082` in `sink.properties`).
+  Omit `management.port` entirely to disable the endpoint with zero overhead.
+
+**Kibana Discover shows no data despite records being indexed**
+- Check that `sink.es-iss.transforms=inject-record-timestamp` is uncommented in
+  `config/sink.properties`. Without it, documents lack the `recordTimestamp` field and
+  Kibana's time filter (which uses that field) matches nothing regardless of the range set.
+- Expand the Kibana time range to cover the period when the consumer was running — the
+  default "Last 15 minutes" window often excludes earlier test runs.
+- Verify records are actually reaching Elasticsearch by checking the consumer log for
+  `Bulk indexed N documents to 'iss-positions-...'` at INFO level.  If you see only
+  `LoggingSink` output and no ES sink output, the bulk requests are failing silently;
+  check for `ERROR` or `WARN` lines from `ElasticsearchSink`.

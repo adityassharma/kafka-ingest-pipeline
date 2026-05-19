@@ -28,7 +28,7 @@ import java.util.stream.Collectors;
  * <h2>Prerequisites</h2>
  * <ul>
  *   <li>Kafka must be running on {@code localhost:9092}</li>
- *   <li>Topic {@code open-notify-iss} must exist with ≥ 1 partition</li>
+ *   <li>Topic {@code open-notify-iss} must exist with ≥ 1 partition (matches pipeline.properties)</li>
  *   <li>Elasticsearch is NOT required for this test</li>
  * </ul>
  *
@@ -48,7 +48,7 @@ class RoundTripIntegrationTest {
     // the test can run without those files present (useful in CI pipelines).
     // ---------------------------------------------------------------------------
     private static final String BOOTSTRAP_SERVERS = "localhost:9092";
-    private static final String TOPIC             = "open-notify-iss";
+    private static final String TOPIC             = "open-notify-iss";  // matches pipeline.properties
     private static final int    NUM_MESSAGES      = 10;
     private static final int    POLL_TIMEOUT_SEC  = 10;
 
