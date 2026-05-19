@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # =============================================================================
-# run-producer.sh
+# run-source.sh
 # Starts the pipeline in source-only mode (producer / ingestion node).
 #
 # Usage:
-#   ./scripts/run-producer.sh [path-to-properties]
+#   ./scripts/run-source.sh [path-to-properties]
 #
 # Defaults to config/source.properties when no argument is given.
 # Pass config/pipeline.properties to run sources AND sinks in the same JVM.
 #
-# See run-consumer.sh for GC rationale and flags documentation.
+# See run-sink.sh for GC rationale and flags documentation.
 # =============================================================================
 
 set -euo pipefail
@@ -55,7 +55,7 @@ if [[ ! -f "${JAR}" ]]; then
     exit 1
 fi
 
-GC_LOG_FILE="${GC_LOG_DIR}/gc-producer-%t.log"
+GC_LOG_FILE="${GC_LOG_DIR}/gc-source-%t.log"
 GC_LOG_FLAGS="-Xlog:gc*,safepoint:file=${GC_LOG_FILE}:time,uptime,pid,level,tags:filesize=10m,filecount=6"
 
 JVM_ARGS=(

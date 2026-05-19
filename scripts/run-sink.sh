@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # =============================================================================
-# run-consumer.sh
+# run-sink.sh
 # Starts the pipeline in sink-only mode (consumer / indexing node).
 #
 # Usage:
-#   ./scripts/run-consumer.sh [path-to-properties]
+#   ./scripts/run-sink.sh [path-to-properties]
 #
 # Defaults to config/sink.properties when no argument is given.
 # Pass config/pipeline.properties to run sources AND sinks in the same JVM.
@@ -92,7 +92,7 @@ fi
 # -Xlog:gc* — unified JVM logging, covers GC, heap, safepoints
 # filesize=10m — roll each GC log at 10 MB
 # filecount=6  — keep 6 rotated files (older auto-deleted)
-GC_LOG_FILE="${GC_LOG_DIR}/gc-consumer-%t.log"
+GC_LOG_FILE="${GC_LOG_DIR}/gc-sink-%t.log"
 GC_LOG_FLAGS="-Xlog:gc*,safepoint:file=${GC_LOG_FILE}:time,uptime,pid,level,tags:filesize=10m,filecount=6"
 
 # ---- Build full JVM arguments ------------------------------------------------

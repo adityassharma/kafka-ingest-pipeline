@@ -730,15 +730,29 @@ works correctly in the fat jar.
 The `sources` and `sinks` keys are both **optional**: if absent or empty the node simply
 skips that side.  This supports three deployment configurations:
 
+The `scripts/` directory contains convenience wrappers that read JVM and GC settings
+from the properties file automatically:
+
+| Script | Default config | Mode |
+|---|---|---|
+| `scripts/run-pipeline.sh` | `config/pipeline.properties` | Combined (sources + sinks) |
+| `scripts/run-source.sh` | `config/source.properties` | Source node only |
+| `scripts/run-sink.sh` | `config/sink.properties` | Sink node only |
+
+All three scripts accept an optional properties file argument to override the default.
+
 ### Option 1 — single server, single JVM (combined)
 
 ```bash
-# Linux/macOS
+# Using the convenience script (Linux/macOS)
+./scripts/run-pipeline.sh
+
+# Or directly
 java -cp target/kafka-ingest-pipeline-1.0.0-fat.jar \
   io.github.adityassharma.kafka.pipeline.PipelineMain \
   config/pipeline.properties
 
-# Windows
+# Windows (direct)
 java -cp target\kafka-ingest-pipeline-1.0.0-fat.jar io.github.adityassharma.kafka.pipeline.PipelineMain config\pipeline.properties
 ```
 
@@ -748,16 +762,12 @@ Both nodes must point `bootstrap.servers` at the same Kafka cluster.
 
 **Source node** (producer / ingestion server):
 ```bash
-java -cp target/kafka-ingest-pipeline-1.0.0-fat.jar \
-  io.github.adityassharma.kafka.pipeline.PipelineMain \
-  config/source.properties
+./scripts/run-source.sh
 ```
 
 **Sink node** (consumer / indexing server):
 ```bash
-java -cp target/kafka-ingest-pipeline-1.0.0-fat.jar \
-  io.github.adityassharma.kafka.pipeline.PipelineMain \
-  config/sink.properties
+./scripts/run-sink.sh
 ```
 
 ### Option 3 — same server, separate JVMs
