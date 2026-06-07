@@ -1,5 +1,6 @@
 # kafka-ingest-pipeline
 
+[![CI](https://github.com/adityassharma/kafka-ingest-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/adityassharma/kafka-ingest-pipeline/actions/workflows/ci.yml)
 
 **This project is primarily a learning exercise** — it is built on the same
 conceptual foundation as Kafka Connect (pluggable sources and sinks, SPI discovery,
